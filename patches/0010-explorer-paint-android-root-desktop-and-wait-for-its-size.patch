@@ -1,0 +1,99 @@
+Subject: [PATCH] explorer: Paint and keep the Android root desktop, wait for its size.
+
+With the Android driver the root desktop window is what is shown, so paint
+its background. Before starting the program, wait (up to 5 seconds) until
+the driver reports the real screen size: windows created earlier keep
+surfaces clipped to the placeholder size, which left them partly drawn.
+Also give the desktop a 3 second close timeout, so that it does not close
+when a launcher such as start.exe exits before its child has attached.
+---
+--- a/programs/explorer/desktop.c
++++ b/programs/explorer/desktop.c
+@@ -43,6 +43,9 @@
+ static const WCHAR default_driver[] = L"mac,x11,wayland";
+ 
+ static BOOL using_root = TRUE;
++/* the Android driver shows the root desktop window, so it needs painting */
++static BOOL paint_root;
++static BOOL display_changed;
+ 
+ struct launcher
+ {
+@@ -796,6 +799,9 @@
+ 
+     switch(message)
+     {
++    case WM_DISPLAYCHANGE:
++        display_changed = TRUE;
++        break;
+     case WM_SYSCOMMAND:
+         switch(wp & 0xfff0)
+         {
+@@ -816,7 +822,7 @@
+         return HTCLIENT;
+ 
+     case WM_ERASEBKGND:
+-        if (!using_root) PaintDesktop( (HDC)wp );
++        if (!using_root || paint_root) PaintDesktop( (HDC)wp );
+         return TRUE;
+ 
+     case WM_SETTINGCHANGE:
+@@ -845,6 +851,7 @@
+                 PaintDesktop( ps.hdc );
+                 draw_launchers( ps.hdc, ps.rcPaint );
+             }
++            else if (paint_root) PaintDesktop( ps.hdc );
+             EndPaint( hwnd, &ps );
+         }
+         return 0;
+@@ -1252,6 +1259,7 @@
+     {
+         DEVMODEW devmode = {.dmPelsWidth = width, .dmPelsHeight = height};
+         /* magic: desktop "root" means use the root window */
++        paint_root = driver && !wcsicmp( driver, L"android" );
+         if ((using_root = !wcsicmp( name, L"root" ))) desktop = CreateDesktopW( name, NULL, NULL, DF_WINE_ROOT_DESKTOP, DESKTOP_ALL_ACCESS, NULL );
+         else desktop = CreateDesktopW( name, NULL, &devmode, DF_WINE_VIRTUAL_DESKTOP, DESKTOP_ALL_ACCESS, NULL );
+         if (!desktop)
+@@ -1260,6 +1268,15 @@
+             ExitProcess( 1 );
+         }
+         SetThreadDesktop( desktop );
++
++        /* the desktop closes as soon as no program uses it; programs that
++         * start another one and exit, like start.exe or installers, would
++         * close it before their child attaches, so allow a grace period */
++        if (paint_root)
++        {
++            DWORD timeout = 3000;
++            SetUserObjectInformationW( desktop, 1000, &timeout, sizeof(timeout) );
++        }
+     }
+ 
+     /* the desktop process should always have an admin token */
+@@ -1300,6 +1317,26 @@
+         }
+     }
+ 
++    /* the Android driver gets the screen size from Java asynchronously, and
++     * windows created before it arrives keep surfaces clipped to the
++     * placeholder size, so wait for it before starting the program */
++    if (hwnd && paint_root)
++    {
++        DWORD start = GetTickCount();
++        MSG msg;
++
++        while (!display_changed && GetTickCount() - start < 5000)
++        {
++            MsgWaitForMultipleObjects( 0, NULL, FALSE, 100, QS_ALLINPUT );
++            while (PeekMessageW( &msg, 0, 0, 0, PM_REMOVE ))
++            {
++                TranslateMessage( &msg );
++                DispatchMessageW( &msg );
++            }
++        }
++        if (!display_changed) WARN( "no display size from the driver\n" );
++    }
++
+     /* if we have a command line, execute it */
+     if (cmdline)
+     {

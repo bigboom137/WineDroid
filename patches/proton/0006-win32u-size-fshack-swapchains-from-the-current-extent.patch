@@ -1,0 +1,21 @@
+Subject: [PATCH] win32u: Size fshack swapchains from the current surface extent.
+
+The DPI fullscreen hack made the host swapchain minImageExtent big,
+which is the window size on X11 but 1x1 on Android, so nothing showed.
+Use currentExtent when the surface has one.
+---
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -2598,8 +2598,10 @@
+         if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT))
+             FIXME( "Swapchain does not support required VK_IMAGE_USAGE_STORAGE_BIT\n" );
+ 
+-        swapchain->host_extents = capabilities.minImageExtent;
+-        create_info_host.imageExtent = capabilities.minImageExtent;
++        /* the host window's size; minImageExtent is only the same thing on X11 (Android says 1x1) */
++        if (capabilities.currentExtent.width != 0xffffffff) swapchain->host_extents = capabilities.currentExtent;
++        else swapchain->host_extents = capabilities.minImageExtent;
++        create_info_host.imageExtent = swapchain->host_extents;
+         create_info_host.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
+         create_info_host.imageUsage = VK_IMAGE_USAGE_STORAGE_BIT;
+ 

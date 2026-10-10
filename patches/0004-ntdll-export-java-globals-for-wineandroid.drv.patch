@@ -1,0 +1,22 @@
+Subject: [PATCH] ntdll: Export the Java globals for wineandroid.drv.
+
+wineandroid.drv finds java_vm and java_object with dlsym(), but ntdll is
+built with -fvisibility=hidden, so the lookups failed and the driver
+could not initialize ("The graphics driver is missing").
+---
+--- a/dlls/ntdll/unix/loader.c	2026-10-09 16:26:43.584817134 +0000
++++ b/dlls/ntdll/unix/loader.c	2026-10-09 16:26:43.584817134 +0000
+@@ -1932,9 +1932,10 @@
+ #define WINE_JAVA_CLASS "org/winehq/wine/WineActivity"
+ #endif
+ 
+-JavaVM *java_vm = NULL;
+-jobject java_object = 0;
+-unsigned short java_gdt_sel = 0;
++/* looked up with dlsym() by wineandroid.drv */
++DECLSPEC_EXPORT JavaVM *java_vm = NULL;
++DECLSPEC_EXPORT jobject java_object = 0;
++DECLSPEC_EXPORT unsigned short java_gdt_sel = 0;
+ 
+ /* main Wine initialisation */
+ static jstring wine_init_jni( JNIEnv *env, jobject obj, jobjectArray cmdline, jobjectArray environment )

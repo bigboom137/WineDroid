@@ -1,0 +1,18 @@
+Subject: [PATCH] wineandroid.drv: Take the vulkan_surface_create raw flag.
+
+Proton passes whether its fullscreen hack is on; Android has no
+fullscreen hack, so the flag is ignored.
+---
+--- a/dlls/wineandroid.drv/vulkan.c
++++ b/dlls/wineandroid.drv/vulkan.c
+@@ -66,8 +66,8 @@
+     return CONTAINING_RECORD( client, struct android_vulkan_surface, client );
+ }
+ 
+-static VkResult android_vulkan_surface_create( HWND hwnd, const struct vulkan_instance *instance, VkSurfaceKHR *handle,
+-                                               struct client_surface **client )
++static VkResult android_vulkan_surface_create( HWND hwnd, BOOL raw, const struct vulkan_instance *instance,
++                                               VkSurfaceKHR *handle, struct client_surface **client )
+ {
+     VkAndroidSurfaceCreateInfoKHR info = { .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR };
+     PFN_vkCreateAndroidSurfaceKHR p_vkCreateAndroidSurfaceKHR;

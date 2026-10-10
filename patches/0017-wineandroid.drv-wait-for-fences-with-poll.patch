@@ -1,0 +1,53 @@
+Subject: [PATCH] wineandroid.drv: Wait for fences with poll().
+
+Buffer fences are sync_file fds, which are waited on with poll().
+SYNC_IOC_WAIT was the ioctl of Android's old sync driver; current kernels
+don't have it, so the ioctl failed and nothing waited: buffers were queued
+to the display while the GPU still drew into them, and dequeued ones were
+drawn into while still being read. The screen then showed a mix of the new
+and an older frame, e.g. parts of the text in Steam's web UI vanished for
+a frame while typing.
+---
+--- a/dlls/wineandroid.drv/device.c
++++ b/dlls/wineandroid.drv/device.c
+@@ -26,6 +26,7 @@
+ 
+ #include <assert.h>
+ #include <errno.h>
++#include <poll.h>
+ #include <stdio.h>
+ #include <stdarg.h>
+ #include <sys/ioctl.h>
+@@ -44,10 +45,6 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(android);
+ 
+-#ifndef SYNC_IOC_WAIT
+-#define SYNC_IOC_WAIT _IOW('>', 0, __s32)
+-#endif
+-
+ static HANDLE thread;
+ static JNIEnv *jni_env;
+ static HWND capture_window;
+@@ -318,12 +315,19 @@
+     return HandleToLong( parent );
+ }
+ 
++/* Fences are sync_file fds, which are waited on with poll(); SYNC_IOC_WAIT was
++ * the ioctl of Android's old sync driver, which current kernels don't have, so
++ * buffers were queued while the GPU still drew into them and the screen showed
++ * a mix of the new and an older frame (parts of text vanishing for a frame) */
+ static void wait_fence_and_close( int fence )
+ {
+-    __s32 timeout = 1000;  /* FIXME: should be -1 for infinite timeout */
++    struct pollfd pfd = { .fd = fence, .events = POLLIN };
++    int ret;
+ 
+     if (fence == -1) return;
+-    ioctl( fence, SYNC_IOC_WAIT, &timeout );
++    do ret = poll( &pfd, 1, 1000 );  /* FIXME: should be -1 for infinite timeout */
++    while (ret < 0 && errno == EINTR);
++    if (ret <= 0) WARN( "fence %d not signaled: %d\n", fence, ret );
+     close( fence );
+ }
+ 

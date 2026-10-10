@@ -1,0 +1,36 @@
+Subject: [PATCH] win32u: Let WineDroid choose the desktop of new processes.
+
+Programs WineDroid starts from Java have no Windows parent, so they open on
+the "Default" desktop, which has no display driver, and never show up.
+WINEDROID_DESKTOP puts them on the Android desktop instead.
+---
+--- a/dlls/win32u/winstation.c	2026-10-09 16:39:40.993433421 +0000
++++ b/dlls/win32u/winstation.c	2026-10-09 16:39:40.993433421 +0000
+@@ -27,6 +27,7 @@
+ #include <stddef.h>
+ 
+ #include <pthread.h>
++#include <stdlib.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -932,6 +933,19 @@
+ 
+     static const WCHAR defaultW[] = {'D','e','f','a','u','l','t',0};
+ 
++#ifdef __ANDROID__
++    {
++        /* WineActivity sets this for the programs it starts, so they open on
++         * its desktop rather than one without a display driver */
++        const char *name = getenv( "WINEDROID_DESKTOP" );
++        if (name && *name && strlen( name ) < buf_size / sizeof(WCHAR))
++        {
++            asciiz_to_unicode( buffer, name );
++            return buffer;
++        }
++    }
++#endif
++
+     if ((p = wcsrchr( appname, '/' ))) appname = p + 1;
+     if ((p = wcsrchr( appname, '\\' ))) appname = p + 1;
+     len = lstrlenW(appname);

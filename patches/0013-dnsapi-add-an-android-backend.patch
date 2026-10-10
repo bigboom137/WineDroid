@@ -1,0 +1,205 @@
+Subject: [PATCH] dnsapi: Add an Android backend.
+
+bionic has no resolver state (_res, ns_initparse), so configure finds no
+resolver library and dnsapi.so was built without any unix calls. Every
+DnsQueryConfig() then faulted in the unix call dispatcher, and since
+GetAdaptersAddresses() asks dnsapi for each adapter's DNS servers, it
+failed with STATUS_ACCESS_VIOLATION for every caller.
+
+On Android, read the DNS servers from the file named by WINEDROID_DNS,
+which the app writes from ConnectivityManager, report an empty search
+list, and send queries through bionic's res_query(), which goes to netd.
+---
+--- a/dlls/dnsapi/libresolv.c
++++ b/dlls/dnsapi/libresolv.c
+@@ -24,7 +24,7 @@
+ 
+ #include "config.h"
+ 
+-#ifdef HAVE_RESOLV
++#if defined(HAVE_RESOLV) || defined(__ANDROID__)
+ #include <stdarg.h>
+ #include <string.h>
+ #include <stdio.h>
+@@ -43,6 +43,9 @@
+ #ifdef HAVE_NETDB_H
+ # include <netdb.h>
+ #endif
++#ifdef __ANDROID__
++# include <arpa/inet.h>
++#endif
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -59,6 +62,8 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dnsapi);
+ 
++#ifdef HAVE_RESOLV
++
+ /* call res_init() just once because of a bug in Mac OS X 10.4 */
+ /* call once per thread on systems that have per-thread _res */
+ static void init_resolver( void )
+@@ -105,6 +110,8 @@
+     return ret;
+ }
+ 
++#endif /* HAVE_RESOLV */
++
+ static DNS_STATUS map_h_errno( int error )
+ {
+     switch (error)
+@@ -122,6 +129,17 @@
+     }
+ }
+ 
++static inline int filter( unsigned short sin_family, USHORT family )
++{
++    if (sin_family != AF_INET && sin_family != AF_INET6) return TRUE;
++    if (sin_family == AF_INET6 && family == WS_AF_INET) return TRUE;
++    if (sin_family == AF_INET && family == WS_AF_INET6) return TRUE;
++
++    return FALSE;
++}
++
++#ifdef HAVE_RESOLV
++
+ static NTSTATUS resolv_get_searchlist( void *args )
+ {
+     const struct get_searchlist_params *params = args;
+@@ -152,15 +170,6 @@
+ }
+ 
+ 
+-static inline int filter( unsigned short sin_family, USHORT family )
+-{
+-    if (sin_family != AF_INET && sin_family != AF_INET6) return TRUE;
+-    if (sin_family == AF_INET6 && family == WS_AF_INET) return TRUE;
+-    if (sin_family == AF_INET && family == WS_AF_INET6) return TRUE;
+-
+-    return FALSE;
+-}
+-
+ #ifdef HAVE_RES_GETSERVERS
+ 
+ static NTSTATUS resolv_get_serverlist( void *args )
+@@ -341,6 +350,113 @@
+     return ret;
+ }
+ 
++#else  /* HAVE_RESOLV */
++
++/* Android has no resolver state and keeps the DNS servers to itself, so
++ * WineDroid writes the ones ConnectivityManager reports, one address per
++ * line, to the file named by WINEDROID_DNS. */
++static int get_android_servers( struct sockaddr_in6 *servers, int max )
++{
++    const char *path = getenv( "WINEDROID_DNS" );
++    char line[64];
++    FILE *fp;
++    int count = 0;
++
++    if (!path || !(fp = fopen( path, "r" ))) return 0;
++    while (count < max && fgets( line, sizeof(line), fp ))
++    {
++        struct sockaddr_in *sin = (struct sockaddr_in *)&servers[count];
++
++        line[strcspn( line, " \t\r\n" )] = 0;
++        memset( &servers[count], 0, sizeof(servers[count]) );
++        if (inet_pton( AF_INET, line, &sin->sin_addr ) == 1) sin->sin_family = AF_INET;
++        else if (inet_pton( AF_INET6, line, &servers[count].sin6_addr ) == 1) servers[count].sin6_family = AF_INET6;
++        else continue;
++        count++;
++    }
++    fclose( fp );
++    return count;
++}
++
++static NTSTATUS resolv_get_searchlist( void *args )
++{
++    const struct get_searchlist_params *params = args;
++
++    if (!params->list || *params->len < sizeof(WCHAR))
++    {
++        *params->len = sizeof(WCHAR);
++        return !params->list ? ERROR_SUCCESS : ERROR_MORE_DATA;
++    }
++    *params->len = sizeof(WCHAR);
++    params->list[0] = 0;
++    return ERROR_SUCCESS;
++}
++
++static NTSTATUS resolv_get_serverlist( void *args )
++{
++    const struct get_serverlist_params *params = args;
++    DNS_ADDR_ARRAY *addrs = params->addrs;
++    struct sockaddr_in6 servers[8];
++    DWORD i, total, found, needed;
++
++    total = get_android_servers( servers, ARRAY_SIZE(servers) );
++    for (i = 0, found = 0; i < total; i++)
++        if (!filter( servers[i].sin6_family, params->family )) found++;
++    if (!found) return DNS_ERROR_NO_DNS_SERVERS;
++
++    needed = FIELD_OFFSET(DNS_ADDR_ARRAY, AddrArray[found]);
++    if (!addrs || *params->len < needed)
++    {
++        *params->len = needed;
++        return !addrs ? ERROR_SUCCESS : ERROR_MORE_DATA;
++    }
++    *params->len = needed;
++    memset( addrs, 0, needed );
++    addrs->AddrCount = addrs->MaxCount = found;
++
++    for (i = 0, found = 0; i < total; i++)
++    {
++        if (filter( servers[i].sin6_family, params->family )) continue;
++
++        if (servers[i].sin6_family == AF_INET6)
++        {
++            SOCKADDR_IN6 *sa = (SOCKADDR_IN6 *)addrs->AddrArray[found].MaxSa;
++            sa->sin6_family = WS_AF_INET6;
++            memcpy( &sa->sin6_addr, &servers[i].sin6_addr, sizeof(sa->sin6_addr) );
++            addrs->AddrArray[found].Data.DnsAddrUserDword[0] = sizeof(*sa);
++        }
++        else
++        {
++            SOCKADDR_IN *sa = (SOCKADDR_IN *)addrs->AddrArray[found].MaxSa;
++            sa->sin_family = WS_AF_INET;
++            sa->sin_addr.WS_s_addr = ((struct sockaddr_in *)&servers[i])->sin_addr.s_addr;
++            addrs->AddrArray[found].Data.DnsAddrUserDword[0] = sizeof(*sa);
++        }
++        found++;
++    }
++    return ERROR_SUCCESS;
++}
++
++static NTSTATUS resolv_set_serverlist( void *args )
++{
++    FIXME( "not supported on Android\n" );
++    return ERROR_SUCCESS;
++}
++
++/* bionic's res_query() goes through netd like every other lookup */
++static NTSTATUS resolv_query( void *args )
++{
++    const struct query_params *params = args;
++    int len;
++
++    if ((len = res_query( params->name, ns_c_in, params->type, params->buf, *params->len )) < 0)
++        return map_h_errno( h_errno );
++    *params->len = len;
++    return ERROR_SUCCESS;
++}
++
++#endif /* HAVE_RESOLV */
++
+ const unixlib_entry_t __wine_unix_call_funcs[] =
+ {
+     resolv_get_searchlist,
+@@ -426,4 +542,4 @@
+ 
+ #endif  /* _WIN64 */
+ 
+-#endif /* HAVE_RESOLV */
++#endif /* HAVE_RESOLV || __ANDROID__ */

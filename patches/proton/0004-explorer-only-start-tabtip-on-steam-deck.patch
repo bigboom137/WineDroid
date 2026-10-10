@@ -1,0 +1,29 @@
+Subject: [PATCH] explorer: Only start tabtip.exe on the Steam Deck.
+
+tabtip.exe only drives Steam's on-screen keyboard; outside the Steam Deck
+it is not needed, so start it only when SteamDeck=1.
+---
+--- a/programs/explorer/desktop.c
++++ b/programs/explorer/desktop.c
+@@ -1290,6 +1290,7 @@
+     DWORD id;
+     NTSTATUS status;
+     HANDLE tabtip = NULL;
++    WCHAR use_deck[2];
+ 
+     {
+         char s[1024];
+@@ -1446,8 +1447,11 @@
+     /* run the desktop message loop */
+     if (hwnd)
+     {
+-        /* FIXME: hack, run tabtip.exe on startup. */
+-        tabtip = start_tabtip_process();
++        /* FIXME: hack, run tabtip.exe on startup. It only drives Steam's
++         * on-screen keyboard, so skip it outside the Steam Deck (WineDroid). */
++        if (GetEnvironmentVariableW( L"SteamDeck", use_deck, ARRAY_SIZE(use_deck) ) == 1 &&
++            use_deck[0] == '1')
++            tabtip = start_tabtip_process();
+ 
+         start_xalia_process();
+ 

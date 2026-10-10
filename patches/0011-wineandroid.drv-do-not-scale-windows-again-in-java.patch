@@ -1,0 +1,30 @@
+Subject: [PATCH] wineandroid.drv: Do not scale windows again in Java.
+
+win32u now reports window positions in screen pixels and scales the drawing
+of DPI-unaware windows itself, so the raw/window DPI ratio passed to Java
+scaled such windows a second time: at 260 dpi they were 2.7 times too big,
+mostly off screen, blurry, and touches missed them. Always pass 1.0.
+---
+--- a/dlls/wineandroid.drv/window.c
++++ b/dlls/wineandroid.drv/window.c
+@@ -99,8 +99,7 @@
+     if ((data = calloc( 1, sizeof(*data) )))
+     {
+         data->hwnd = hwnd;
+-        data->window = create_ioctl_window( hwnd, FALSE,
+-                                            (float)NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ) / NtUserGetDpiForWindow( hwnd ));
++        data->window = create_ioctl_window( hwnd, FALSE, 1.0f );
+         pthread_mutex_lock( &win_data_mutex );
+         win_data_context[context_idx(hwnd)] = data;
+     }
+@@ -1115,7 +1114,9 @@
+     TRACE( "win %p parent %p -> %p\n", hwnd, old_parent, parent );
+ 
+     data->parent = (parent == NtUserGetDesktopWindow()) ? 0 : parent;
+-    ioctl_set_window_parent( hwnd, parent, (float)NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ) / NtUserGetDpiForWindow( hwnd ));
++    /* win32u already gives us window positions in screen pixels and scales
++     * the drawing of DPI-unaware windows, so Java must not scale them again */
++    ioctl_set_window_parent( hwnd, parent, 1.0f );
+     release_win_data( data );
+ }
+ 

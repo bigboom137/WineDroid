@@ -1,0 +1,140 @@
+Subject: [PATCH] wineandroid.drv: Support 32-bit programs and report a placeholder screen size.
+
+32-bit programs run through WoW64, and the driver had no WoW64 unix call
+table, so it failed to load in them ("no driver could be loaded"). Add one:
+init is thunked, and the device and Java calls, which only the 64-bit
+desktop process makes, are refused. In a WoW64 process ntdll also stores
+ioctl results in the 32-bit status block that iosb.Pointer refers to, so
+give android_ioctl() one; otherwise the result was written to address
+0x103 (STATUS_PENDING) and crashed window creation.
+
+Until Java reports the screen size, report a 1024x768 placeholder mode
+instead of an empty one, which win32u divides by when computing the DPI.
+---
+--- a/dlls/wineandroid.drv/android.h
++++ b/dlls/wineandroid.drv/android.h
+@@ -61,6 +61,7 @@
+  */
+ 
+ extern void start_android_device(void);
++extern BOOL is_wow64;
+ extern void register_native_window( HWND hwnd, struct ANativeWindow *win, BOOL client );
+ extern struct ANativeWindow *create_ioctl_window( HWND hwnd, BOOL opengl, float scale );
+ extern struct ANativeWindow *grab_ioctl_window( struct ANativeWindow *window );
+--- a/dlls/wineandroid.drv/device.c
++++ b/dlls/wineandroid.drv/device.c
+@@ -1191,12 +1191,21 @@
+ /* Client-side ioctl support */
+ 
+ 
++BOOL is_wow64 = FALSE;
++
+ static int android_ioctl( enum android_ioctl code, void *in, DWORD in_size, void *out, DWORD *out_size )
+ {
+     /* NtCreateFile needs an NT path, not \\.\WineAndroid */
+     static const WCHAR deviceW[] = {'\\','?','?','\\','W','i','n','e','A','n','d','r','o','i','d',0 };
+     static HANDLE device;
+     IO_STATUS_BLOCK iosb;
++    /* in 32-bit programs ntdll stores the result in the 32-bit block that
++     * iosb.Pointer refers to, as if the call had come from 32-bit code */
++    struct
++    {
++        NTSTATUS Status;
++        ULONG Information;
++    } iosb32;
+     NTSTATUS status;
+ 
+     if (!device)
+@@ -1218,8 +1227,19 @@
+ 
+     iosb.Status = STATUS_PENDING;  /* still set if the device failed the request */
+     iosb.Information = 0;
++    if (is_wow64)
++    {
++        iosb32.Status = STATUS_PENDING;
++        iosb32.Information = 0;
++        iosb.Pointer = &iosb32;
++    }
+     status = NtDeviceIoControlFile( device, NULL, NULL, NULL, &iosb, ANDROID_IOCTL(code),
+                                     in, in_size, out, out_size ? *out_size : 0 );
++    if (is_wow64)
++    {
++        iosb.Status = iosb32.Status;
++        iosb.Information = iosb32.Information;
++    }
+     /* errors from the device don't update the iosb of a synchronous request */
+     if (!status && iosb.Status == STATUS_PENDING) status = STATUS_DEVICE_NOT_READY;
+     if (status == STATUS_FILE_DELETED)
+--- a/dlls/wineandroid.drv/init.c
++++ b/dlls/wineandroid.drv/init.c
+@@ -270,18 +270,24 @@
+ UINT ANDROID_UpdateDisplayDevices( const struct gdi_device_manager *device_manager, void *param )
+ {
+     static const DWORD source_flags = DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE | DISPLAY_DEVICE_VGA_COMPATIBLE;
++    /* until Java reports the screen size, report a placeholder instead of an
++     * empty 0x0 mode, which win32u would divide by when computing the DPI */
++    static const RECT default_rect = { 0, 0, 1024, 768 };
++    BOOL have_size = screen_width && screen_height;
+     struct pci_id pci_id = {0};
+     struct gdi_monitor gdi_monitor =
+     {
+-        .rc_monitor = virtual_screen_rect,
+-        .rc_work = monitor_rc_work,
++        .rc_monitor = have_size ? virtual_screen_rect : default_rect,
++        .rc_work = have_size ? monitor_rc_work : default_rect,
+     };
+     const DEVMODEW mode =
+     {
+         .dmSize = sizeof(mode),
+         .dmFields = DM_DISPLAYORIENTATION | DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL |
+                     DM_DISPLAYFLAGS | DM_DISPLAYFREQUENCY,
+-        .dmBitsPerPel = screen_bpp, .dmPelsWidth = screen_width, .dmPelsHeight = screen_height, .dmDisplayFrequency = 60,
++        .dmBitsPerPel = screen_bpp, .dmDisplayFrequency = 60,
++        .dmPelsWidth = have_size ? screen_width : default_rect.right,
++        .dmPelsHeight = have_size ? screen_height : default_rect.bottom,
+     };
+     UINT dpi = NtUserGetSystemDpiForProcess( NULL );
+     DEVMODEW current = mode;
+@@ -577,3 +583,42 @@
+ 
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
++
++
++#ifdef _WIN64
++
++/* 32-bit programs only load the driver to draw; the device and Java calls
++ * are only made by the 64-bit desktop process */
++
++static NTSTATUS wow64_android_init( void *arg )
++{
++    struct
++    {
++        ULONG register_window_callback;
++        UINT64 start_device_callback;
++    } *params32 = arg;
++    struct init_params params;
++
++    is_wow64 = TRUE;
++    params.register_window_callback = ULongToPtr( params32->register_window_callback );
++    params.start_device_callback = params32->start_device_callback;
++    return android_init( &params );
++}
++
++static NTSTATUS wow64_android_unsupported( void *arg )
++{
++    return STATUS_NOT_SUPPORTED;
++}
++
++const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
++{
++    wow64_android_unsupported,  /* dispatch_ioctl */
++    wow64_android_init,
++    wow64_android_unsupported,  /* java_init */
++    wow64_android_unsupported,  /* java_uninit */
++    wow64_android_unsupported,  /* register_window */
++};
++
++C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
++
++#endif /* _WIN64 */

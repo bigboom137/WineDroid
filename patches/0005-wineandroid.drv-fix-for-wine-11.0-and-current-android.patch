@@ -1,0 +1,87 @@
+Subject: [PATCH] wineandroid.drv: Fix for Wine 11.0 and current Android.
+
+- CreateDesktop is now called before the desktop window and its event
+  queue exist, which hit the desktop_tid assertion in wait_events(), and
+  returning 0 makes win32u treat the desktop as failed.
+- init_monitors() only reported a display change when a taskbar existed,
+  so the desktop window kept its old size; other processes take the
+  screen size from it.
+- Other processes opened the device as \\.\WineAndroid, which NtCreateFile
+  rejects, so their windows never reached Java.
+- Buffers of CPU-drawn surfaces need CPU usage, or gralloc (e.g. minigbm)
+  refuses to lock them.
+---
+diff -ru a/dlls/wineandroid.drv/device.c b/dlls/wineandroid.drv/device.c
+--- a/dlls/wineandroid.drv/device.c	2026-10-09 16:59:04.411998011 +0000
++++ b/dlls/wineandroid.drv/device.c	2026-10-09 16:59:04.411998011 +0000
+@@ -540,6 +540,11 @@
+     data->generation++;
+     wrap_java_call();
+     if (data->api) win->perform( win, NATIVE_WINDOW_API_CONNECT, data->api );
++    /* buffers are locked for CPU drawing; recent gralloc implementations
++     * refuse to lock buffers that weren't allocated with CPU usage */
++    if (data->api == NATIVE_WINDOW_API_CPU)
++        win->perform( win, NATIVE_WINDOW_SET_USAGE,
++                      GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN );
+     win->perform( win, NATIVE_WINDOW_SET_BUFFERS_FORMAT, data->buffer_format );
+     win->setSwapInterval( win, data->swap_interval );
+     unwrap_java_call();
+@@ -1188,7 +1193,8 @@
+ 
+ static int android_ioctl( enum android_ioctl code, void *in, DWORD in_size, void *out, DWORD *out_size )
+ {
+-    static const WCHAR deviceW[] = {'\\','\\','.','\\','W','i','n','e','A','n','d','r','o','i','d',0 };
++    /* NtCreateFile needs an NT path, not \\.\WineAndroid */
++    static const WCHAR deviceW[] = {'\\','?','?','\\','W','i','n','e','A','n','d','r','o','i','d',0 };
+     static HANDLE device;
+     IO_STATUS_BLOCK iosb;
+     NTSTATUS status;
+diff -ru a/dlls/wineandroid.drv/init.c b/dlls/wineandroid.drv/init.c
+--- a/dlls/wineandroid.drv/init.c	2026-10-09 16:59:04.411998011 +0000
++++ b/dlls/wineandroid.drv/init.c	2026-10-09 16:59:04.411998011 +0000
+@@ -77,14 +77,17 @@
+     virtual_screen_rect.bottom = height;
+     monitor_rc_work = virtual_screen_rect;
+ 
+-    if (!hwnd || !NtUserIsWindowVisible( hwnd )) return;
+-    if (!NtUserGetWindowRect( hwnd, &rect, NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ) )) return;
+-    if (rect.top) monitor_rc_work.bottom = rect.top;
+-    else monitor_rc_work.top = rect.bottom;
+-    TRACE( "found tray %p %s work area %s\n", hwnd,
+-           wine_dbgstr_rect( &rect ), wine_dbgstr_rect( &monitor_rc_work ));
++    if (hwnd && NtUserIsWindowVisible( hwnd ) &&
++        NtUserGetWindowRect( hwnd, &rect, NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ) ))
++    {
++        if (rect.top) monitor_rc_work.bottom = rect.top;
++        else monitor_rc_work.top = rect.bottom;
++        TRACE( "found tray %p %s work area %s\n", hwnd,
++               wine_dbgstr_rect( &rect ), wine_dbgstr_rect( &monitor_rc_work ));
++    }
+ 
+-    /* if we're notified from Java thread, update registry */
++    /* if we're notified from Java thread, update registry; this also resizes
++     * the desktop window, which other processes take the screen size from */
+     if (*p_java_vm) NtUserCallNoParam( NtUserCallNoParam_DisplayModeChanged );
+ }
+ 
+diff -ru a/dlls/wineandroid.drv/window.c b/dlls/wineandroid.drv/window.c
+--- a/dlls/wineandroid.drv/window.c	2026-10-09 16:59:04.411998011 +0000
++++ b/dlls/wineandroid.drv/window.c	2026-10-09 16:59:04.411998011 +0000
+@@ -1240,6 +1240,10 @@
+  */
+ BOOL ANDROID_CreateDesktop( const WCHAR *name, UINT width, UINT height )
+ {
++    /* in Wine 11 this is called before the desktop window and its event
++     * queue exist; the Java side reports the screen size once they do */
++    if (GetCurrentThreadId() != desktop_tid) return TRUE;
++
+     /* wait until we receive the surface changed event */
+     while (!screen_width)
+     {
+@@ -1250,5 +1254,5 @@
+         }
+         process_events( QS_ALLINPUT );
+     }
+-    return 0;
++    return TRUE;
+ }

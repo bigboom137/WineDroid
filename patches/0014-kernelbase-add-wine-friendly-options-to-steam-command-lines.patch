@@ -1,0 +1,65 @@
+Subject: [PATCH] kernelbase: Add Wine-friendly options to Steam's command lines.
+
+Steam's client UI is Chromium (steamwebhelper.exe). Its sandbox can't start
+renderer processes in Wine, so Steam never shows a window; Steam's own
+-no-cef-sandbox turns it off. Chromium also presents only the changed parts
+of a frame (partial swap) and leaves the rest of the swap chain buffer
+stale. Windows' compositor only copies the dirty rectangles, but DXVK shows
+the whole buffer, so typed text appeared, disappeared and reappeared;
+--ui-disable-partial-swap makes Chromium draw whole frames. Add the options
+in CreateProcess, so they apply however the programs are started (steam.exe
+by its installer, its updater or the launcher, the web helper by Steam),
+unless the command line already has them.
+---
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -500,6 +500,36 @@ done:
+     return ret;
+ }
+ 
++/* Steam's web UI is Chromium. Its sandbox can't start renderer processes in
++ * Wine, so Steam never shows a window; Steam's own -no-cef-sandbox turns it
++ * off. Chromium also presents only the changed parts of a frame and leaves
++ * the rest of the swap chain buffer stale, which Windows' compositor never
++ * shows but DXVK does, so text flickers while it is typed; draw whole frames.
++ * Add the options however the programs are started (steam.exe by its
++ * installer, its updater or the launcher, the web helper by Steam). */
++static WCHAR *winedroid_steam_command_line( const WCHAR *app_name, const WCHAR *cmd_line )
++{
++    static const struct { const WCHAR *exe, *arg; } options[] =
++    {
++        { L"steam.exe", L"-no-cef-sandbox" },
++        { L"steamwebhelper.exe", L"--ui-disable-partial-swap" },
++    };
++    const WCHAR *p = wcsrchr( app_name, '\\' );
++    unsigned int i;
++    WCHAR *ret;
++
++    for (i = 0; i < ARRAY_SIZE(options); i++)
++        if (!wcsicmp( p ? p + 1 : app_name, options[i].exe )) break;
++    if (i == ARRAY_SIZE(options) || wcsstr( cmd_line, options[i].arg )) return NULL;
++    if (!(ret = RtlAllocateHeap( GetProcessHeap(), 0,
++                                 (lstrlenW( cmd_line ) + lstrlenW( options[i].arg ) + 2) * sizeof(WCHAR) )))
++        return NULL;
++    lstrcpyW( ret, cmd_line );
++    lstrcatW( ret, L" " );
++    lstrcatW( ret, options[i].arg );
++    return ret;
++}
++
+ /**********************************************************************
+  *           CreateProcessInternalW   (kernelbase.@)
+  */
+@@ -557,6 +587,12 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR
+         }
+     }
+ 
++    if ((p = winedroid_steam_command_line( app_name, tidy_cmdline )))
++    {
++        if (tidy_cmdline != cmd_line) HeapFree( GetProcessHeap(), 0, tidy_cmdline );
++        tidy_cmdline = p;
++    }
++
+     info->hThread = info->hProcess = 0;
+     info->dwProcessId = info->dwThreadId = 0;
+ 

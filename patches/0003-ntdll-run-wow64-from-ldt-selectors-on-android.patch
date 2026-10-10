@@ -1,0 +1,85 @@
+Subject: [PATCH] ntdll: Run WoW64 code from LDT selectors on Android.
+
+Some Android x86_64 devices (e.g. Googlebooks) boot with ia32_emulation=false.
+That disables int $0x80 and the 32-bit GDT code segment, so 32-bit programs
+crash with SIGSEGV in alloc_fs_sel(). The 64-bit modify_ldt syscall still
+works, so use LDT code and %fs selectors, as on macOS.
+---
+--- a/dlls/ntdll/unix/signal_x86_64.c	2026-10-09 16:20:16.055435282 +0000
++++ b/dlls/ntdll/unix/signal_x86_64.c	2026-10-09 16:20:16.059435285 +0000
+@@ -140,6 +140,15 @@
+     unsigned int  garbage : 25;
+ };
+ 
++#ifdef __ANDROID__
++/* Android devices may boot with ia32_emulation=false, which disables int $0x80
++ * and the 32-bit GDT code segment. The 64-bit modify_ldt syscall still works,
++ * so 32-bit code runs from LDT selectors instead, like on macOS. */
++static int modify_ldt( struct modify_ldt_s *ldt )
++{
++    return syscall( __NR_modify_ldt, 0x11, ldt, sizeof(*ldt) );
++}
++#else
+ extern int modify_ldt( struct modify_ldt_s *ldt );
+ __ASM_GLOBAL_FUNC( modify_ldt,
+                    /* switch to 32-bit stack */
+@@ -162,6 +171,7 @@
+                    "popq %r12\n\t"
+                    "popq %rbx\n\t"
+                    "ret" );
++#endif
+ 
+ #ifndef FP_XSTATE_MAGIC1
+ #define FP_XSTATE_MAGIC1 0x46505853
+@@ -908,7 +918,13 @@
+ static inline ucontext_t *init_handler( void *sigcontext )
+ {
+     clear_alignment_flag();
+-#ifdef __linux__
++#ifdef __ANDROID__
++    {
++        struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&get_current_teb()->GdiTebBatch;
++        void *pthread_teb = ((struct amd64_thread_data *)thread_data->cpu_data)->pthread_teb;
++        if (pthread_teb) arch_prctl( ARCH_SET_FS, pthread_teb );
++    }
++#elif defined __linux__
+     if (fs32_sel)
+     {
+         struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&get_current_teb()->GdiTebBatch;
+@@ -938,7 +954,13 @@
+  */
+ static inline void leave_handler( ucontext_t *sigcontext )
+ {
+-#ifdef __linux__
++#ifdef __ANDROID__
++    WORD fs = amd64_thread_data()->fs;
++    if (fs &&
++        !is_inside_signal_stack( (void *)RSP_sig(sigcontext )) &&
++        !is_inside_syscall( RSP_sig(sigcontext) ))
++        __asm__ volatile( "movw %0,%%fs" :: "r" (fs) );
++#elif defined __linux__
+     if (fs32_sel &&
+         !is_inside_signal_stack( (void *)RSP_sig(sigcontext )) &&
+         !is_inside_syscall( RSP_sig(sigcontext) ))
+@@ -2849,7 +2871,10 @@
+ 
+     if (wow_teb)
+     {
+-#ifdef __linux__
++#ifdef __ANDROID__
++        /* fs32_sel stays 0, so each thread gets its own LDT %fs selector */
++        cs32_sel = ldt_alloc_entry( ldt_make_cs32_entry() );
++#elif defined __linux__
+         cs32_sel = 0x23;
+         fs32_sel = alloc_fs_sel( -1, wow_teb );
+ #elif defined(__APPLE__)
+@@ -2906,6 +2931,9 @@
+ 
+ #if defined __linux__
+     arch_prctl( ARCH_SET_GS, teb );
++#ifdef __ANDROID__
++    if (get_wow_teb( teb )) arch_prctl( ARCH_GET_FS, &thread_data->pthread_teb );
++#endif
+     if (fs32_sel)
+     {
+         arch_prctl( ARCH_GET_FS, &thread_data->pthread_teb );

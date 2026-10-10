@@ -1,0 +1,52 @@
+Subject: [PATCH] wineandroid.drv: Allow client surfaces on windows of other processes.
+
+Chromium (Steam's web UI) renders in its GPU process into a child window
+that the browser process created. get_client_window() only knew the
+windows of the calling process, so vkCreateWin32SurfaceKHR failed with
+VK_ERROR_OUT_OF_HOST_MEMORY and DXGI couldn't create a swap chain. The
+device tracks windows by handle, so create the client surface for such a
+window directly. When that process releases it, only drop the surface:
+the window still belongs to its owner (Java drops the client view).
+---
+--- a/dlls/wineandroid.drv/device.c
++++ b/dlls/wineandroid.drv/device.c
+@@ -771,6 +771,26 @@
+ 
+     TRACE( "hwnd %08x opengl %u\n", res->hdr.hwnd, res->hdr.opengl );
+ 
++    if (res->hdr.opengl)
++    {
++        DWORD pid = 0;
++
++        /* another process is done drawing into the window, which stays */
++        NtUserGetWindowThread( LongToHandle(res->hdr.hwnd), &pid );
++        if (pid != current_client_id())
++        {
++            static jmethodID client_method;
++
++            if (win_data) free_native_win_data( win_data );
++            if (!(object = load_java_method( &client_method, "destroyClientView", "(I)V" )))
++                return STATUS_NOT_SUPPORTED;
++            wrap_java_call();
++            (*jni_env)->CallVoidMethod( jni_env, object, client_method, res->hdr.hwnd );
++            unwrap_java_call();
++            return STATUS_SUCCESS;
++        }
++    }
++
+     if (!(object = load_java_method( &method, "destroyWindow", "(I)V" ))) return STATUS_NOT_SUPPORTED;
+ 
+     wrap_java_call();
+--- a/dlls/wineandroid.drv/window.c
++++ b/dlls/wineandroid.drv/window.c
+@@ -1224,7 +1224,9 @@
+     struct android_win_data *data;
+     ANativeWindow *client;
+ 
+-    if (!(data = get_win_data( hwnd ))) return NULL;
++    /* a window of another process, such as the browser window Chromium's GPU process
++     * draws into; the device keeps track of client surfaces by window */
++    if (!(data = get_win_data( hwnd ))) return create_ioctl_window( hwnd, TRUE, 1.0f );
+     if (!data->client) data->client = create_ioctl_window( hwnd, TRUE, 1.0f );
+     client = grab_ioctl_window( data->client );
+     release_win_data( data );

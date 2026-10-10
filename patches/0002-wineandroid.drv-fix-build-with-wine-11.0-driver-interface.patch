@@ -1,0 +1,64 @@
+diff --git a/dlls/wineandroid.drv/android.h b/dlls/wineandroid.drv/android.h
+index 07c0f9e..1ed8340 100644
+--- a/dlls/wineandroid.drv/android.h
++++ b/dlls/wineandroid.drv/android.h
+@@ -53,7 +53,6 @@ DECL_FUNCPTR( ANativeWindow_release );
+  * OpenGL driver
+  */
+ 
+-extern pthread_mutex_t drawable_mutex;
+ extern UINT ANDROID_OpenGLInit( UINT version, const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs );
+ 
+ 
+@@ -95,7 +94,7 @@ extern UINT ANDROID_ShowWindow( HWND hwnd, INT cmd, RECT *rect, UINT swp );
+ extern LRESULT ANDROID_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp );
+ extern BOOL ANDROID_WindowPosChanging( HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects );
+ extern BOOL ANDROID_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface );
+-extern void ANDROID_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags, BOOL fullscreen,
++extern void ANDROID_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                                       const struct window_rects *new_rects, struct window_surface *surface );
+ extern ANativeWindow *get_client_window( HWND hwnd );
+ extern BOOL has_client_surface( HWND hwnd );
+diff --git a/dlls/wineandroid.drv/dllmain.c b/dlls/wineandroid.drv/dllmain.c
+index c8495d6..74d942c 100644
+--- a/dlls/wineandroid.drv/dllmain.c
++++ b/dlls/wineandroid.drv/dllmain.c
+@@ -123,6 +123,6 @@ BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, LPVOID reserved )
+     if (__wine_init_unix_call()) return FALSE;
+ 
+     params.register_window_callback = register_window_callback;
+-    params.start_device_callback = android_start_device;
++    params.start_device_callback = (UINT_PTR)android_start_device;
+     return !ANDROID_CALL( init, &params );
+ }
+diff --git a/dlls/wineandroid.drv/init.c b/dlls/wineandroid.drv/init.c
+index 472de7b..9ceacac 100644
+--- a/dlls/wineandroid.drv/init.c
++++ b/dlls/wineandroid.drv/init.c
+@@ -537,7 +537,6 @@ static HRESULT android_init( void *arg )
+ 
+     pthread_mutexattr_init( &attr );
+     pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
+-    pthread_mutex_init( &drawable_mutex, &attr );
+     pthread_mutex_init( &win_data_mutex, &attr );
+     pthread_mutexattr_destroy( &attr );
+ 
+diff --git a/dlls/wineandroid.drv/opengl.c b/dlls/wineandroid.drv/opengl.c
+index 1efd312..49cccb1 100644
+--- a/dlls/wineandroid.drv/opengl.c
++++ b/dlls/wineandroid.drv/opengl.c
+@@ -75,14 +75,6 @@ static void android_drawable_destroy( struct opengl_drawable *base )
+     release_ioctl_window( gl->window );
+ }
+ 
+-void update_gl_drawable( HWND hwnd )
+-{
+-    /* clear any cached opengl drawable */
+-    set_window_opengl_drawable( hwnd, NULL, TRUE );
+-    set_window_opengl_drawable( hwnd, NULL, FALSE );
+-    NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE );
+-}
+-
+ static BOOL android_surface_create( HWND hwnd, int format, struct opengl_drawable **drawable )
+ {
+     struct gl_drawable *gl;

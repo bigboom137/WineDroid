@@ -1,0 +1,33 @@
+Subject: [PATCH] win32u: Drop the emulated display mode when the Android window is resized.
+
+The physical mode is the size of the Android window. win32u kept the
+emulated mode from the first start (1024x768) and letterboxed it into the
+real window, so windows were drawn in one place and took input in another.
+---
+--- a/dlls/win32u/sysparams.c	2026-01-13 15:56:07.000000000 +0000
++++ b/dlls/win32u/sysparams.c	2026-10-09 18:17:28.619493195 +0000
+@@ -2154,6 +2154,9 @@
+ {
+     struct device_manager_ctx *ctx = param;
+     DEVMODEW dummy, physical, detached = *current, virtual, *virtual_modes = NULL;
++#ifdef __ANDROID__
++    DEVMODEW old_physical = {.dmSize = sizeof(DEVMODEW)};
++#endif
+     UINT virtual_count, modes_count = host_modes_count;
+     const DEVMODEW *modes = host_modes;
+     struct source *source;
+@@ -2186,6 +2189,14 @@
+     {
+         if (!read_source_mode( source->key, ENUM_CURRENT_SETTINGS, &virtual ) || is_detached_mode( &virtual ))
+             virtual = physical;
++#ifdef __ANDROID__
++        /* the physical mode is the size of the Android window; when it changes,
++         * drop the emulated mode rather than letterboxing it into the new size */
++        else if (!read_source_mode( source->key, WINE_ENUM_PHYSICAL_SETTINGS, &old_physical ) ||
++                 old_physical.dmPelsWidth != physical.dmPelsWidth ||
++                 old_physical.dmPelsHeight != physical.dmPelsHeight)
++            virtual = physical;
++#endif
+ 
+         if ((virtual_modes = get_virtual_modes( current, &physical, host_modes, host_modes_count, &virtual_count )))
+         {

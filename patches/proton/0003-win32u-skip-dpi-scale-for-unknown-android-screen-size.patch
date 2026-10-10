@@ -1,0 +1,23 @@
+Subject: [PATCH] win32u: Do not compute a DPI scale from an unknown Android screen size.
+
+Before Java reports the window size the physical and current modes can be
+0x0, and gcd() of zeros is 0, which crashed winecfg and other programs with
+a division by zero.
+---
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -2490,7 +2490,13 @@
+     UINT dpi, dpi_ret;
+ 
+     if (!source || !(dpi = source->dpi)) dpi = system_dpi;
+-    if (source && type != MDT_EFFECTIVE_DPI)
++    if (source && type != MDT_EFFECTIVE_DPI
++#ifdef __ANDROID__
++        /* the Android window size may not be known yet; gcd() of zeros is 0 */
++        && source->physical.dmPelsWidth && source->current.dmPelsWidth
++        && source->physical.dmPelsHeight && source->current.dmPelsHeight
++#endif
++        )
+     {
+         UINT num, den, d;
+ 

@@ -1,0 +1,62 @@
+Subject: [PATCH] wineandroid.drv: Fix lost device errors and racing surface flushes.
+
+The WineAndroid device was opened for asynchronous I/O, so an error such as
+"not ready" (a window whose Android surface does not exist yet) completed
+after android_ioctl() had returned and was written into its stale stack
+frame. That corrupted buffer ids and crashed new processes, which left the
+USER lock held ("BUG: holding USER lock"). Open the device synchronously
+and treat an untouched status block as a failed request.
+
+Also serialize surface flushes: all the surfaces of a window share one
+native window wrapper and its buffer cache.
+---
+--- a/dlls/wineandroid.drv/device.c	2026-10-09 18:52:58.600644064 +0000
++++ b/dlls/wineandroid.drv/device.c	2026-10-09 18:47:58.972635576 +0000
+@@ -1211,13 +1211,17 @@
+         InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, NULL, NULL );
+         status = NtCreateFile( &file, GENERIC_READ | SYNCHRONIZE, &attr, &io, NULL, 0,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
+-                               FILE_NON_DIRECTORY_FILE, NULL, 0 );
++                               FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0 );
+         if (status) return -ENOENT;
+         if (InterlockedCompareExchangePointer( &device, file, NULL )) NtClose( file );
+     }
+ 
++    iosb.Status = STATUS_PENDING;  /* still set if the device failed the request */
++    iosb.Information = 0;
+     status = NtDeviceIoControlFile( device, NULL, NULL, NULL, &iosb, ANDROID_IOCTL(code),
+                                     in, in_size, out, out_size ? *out_size : 0 );
++    /* errors from the device don't update the iosb of a synchronous request */
++    if (!status && iosb.Status == STATUS_PENDING) status = STATUS_DEVICE_NOT_READY;
+     if (status == STATUS_FILE_DELETED)
+     {
+         WARN( "parent process is gone\n" );
+--- a/dlls/wineandroid.drv/window.c	2026-10-09 18:52:58.600644064 +0000
++++ b/dlls/wineandroid.drv/window.c	2026-10-09 18:30:10.116569759 +0000
+@@ -605,11 +605,18 @@
+     ANativeWindow_Buffer buffer;
+     ARect rc;
+ 
++    /* the native window wrapper and its buffer cache are shared by all the surfaces
++     * of a window, and win32u may flush surfaces from several threads at once */
++    static pthread_mutex_t flush_mutex = PTHREAD_MUTEX_INITIALIZER;
++
++    if (!surface->window) return TRUE;
++
+     rc.left   = dirty->left;
+     rc.top    = dirty->top;
+     rc.right  = dirty->right;
+     rc.bottom = dirty->bottom;
+ 
++    pthread_mutex_lock( &flush_mutex );
+     if (!surface->window->perform( surface->window, NATIVE_WINDOW_LOCK, &buffer, &rc ))
+     {
+         const RECT *rgn_rect = surface->clip_rects, *end = surface->clip_rects + surface->clip_count;
+@@ -660,6 +667,7 @@
+     }
+     else TRACE( "Unable to lock surface %p window %p buffer %p\n",
+                 surface, window_surface->hwnd, surface->window );
++    pthread_mutex_unlock( &flush_mutex );
+ 
+     return TRUE;
+ }

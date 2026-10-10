@@ -1,0 +1,22 @@
+Subject: [PATCH] win32u: Keep the window surface of client surface windows on Android.
+
+Proton drops the window surface of windows with OpenGL or Vulkan client
+surfaces. On Android the client surface is a view below the window's own
+view, so without a window surface the last frame of it stays on top and
+hides the rendering. Keep it; the server already clips the client area
+out of it.
+---
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2108,6 +2108,11 @@
+     win_rect = win->rects.window;
+     release_win_ptr( win );
+ 
++#ifdef __ANDROID__
++    /* Android client surfaces are views under the window's own view, so the window surface
++     * must stay to draw the non-client area and leave the client area transparent */
++    ret = FALSE;
++#endif
+     if (ret) return !force_present_to_surface( &win_rect );
+ 
+     return ret;

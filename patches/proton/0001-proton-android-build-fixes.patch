@@ -1,0 +1,84 @@
+diff --git a/dlls/ntdll/unix/fsync.c b/dlls/ntdll/unix/fsync.c
+index 25d41ca..a17e680 100644
+--- a/dlls/ntdll/unix/fsync.c
++++ b/dlls/ntdll/unix/fsync.c
+@@ -55,6 +55,12 @@
+ #include "unix_private.h"
+ #include "fsync.h"
+ 
++#ifdef __ANDROID__
++/* bionic has no POSIX shared memory; fsync stays disabled on Android */
++static inline int shm_open( const char *name, int flags, mode_t mode ) { errno = ENOSYS; return -1; }
++static inline int shm_unlink( const char *name ) { errno = ENOSYS; return -1; }
++#endif
++
+ WINE_DEFAULT_DEBUG_CHANNEL(fsync);
+ 
+ #include "pshpack4.h"
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index f8aa468..cc243c5 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -2451,7 +2451,9 @@ static void start_main_thread(void)
+     set_thread_teb( teb );
+ #endif
+ 
++#ifdef M_PERTURB
+     mallopt( M_PERTURB, 0xff );
++#endif
+     init_startup_info();
+     *(ULONG_PTR *)&peb->CloudFileFlags = get_image_address();
+     set_load_order_app_name( main_wargv[0] );
+@@ -2460,7 +2462,9 @@ static void start_main_thread(void)
+     load_ntdll();
+     load_wow64_ntdll( main_image_info.Machine );
+     load_apiset_dll();
++#ifdef M_PERTURB
+     mallopt( M_PERTURB, 0 );
++#endif
+     server_init_process_done();
+ }
+ 
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 110404c..b466369 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2279,7 +2279,7 @@ __ASM_GLOBAL_FUNC( dump_syscall_fault_return,
+                    "movq %rdi,%rsp\n\t"
+                    "movq %rsi,%rax\n\t"
+                    "movq %rdx,%r13\n\t"
+-                   "jmp %rcx")
++                   "jmp *%rcx")
+ 
+ 
+ static void dump_syscall_fault( CONTEXT *context, DWORD exc_code )
+diff --git a/dlls/wineandroid.drv/opengl.c b/dlls/wineandroid.drv/opengl.c
+index 49cccb1..b30d147 100644
+--- a/dlls/wineandroid.drv/opengl.c
++++ b/dlls/wineandroid.drv/opengl.c
+@@ -75,7 +75,7 @@ static void android_drawable_destroy( struct opengl_drawable *base )
+     release_ioctl_window( gl->window );
+ }
+ 
+-static BOOL android_surface_create( HWND hwnd, int format, struct opengl_drawable **drawable )
++static BOOL android_surface_create( HWND hwnd, BOOL raw, int format, struct opengl_drawable **drawable )
+ {
+     struct gl_drawable *gl;
+ 
+diff --git a/server/fsync.c b/server/fsync.c
+index 7d3ec64..a302f9c 100644
+--- a/server/fsync.c
++++ b/server/fsync.c
+@@ -45,6 +45,12 @@
+ #include "request.h"
+ #include "fsync.h"
+ 
++#ifdef __ANDROID__
++/* bionic has no POSIX shared memory; fsync stays disabled on Android */
++static inline int shm_open( const char *name, int flags, mode_t mode ) { errno = ENOSYS; return -1; }
++static inline int shm_unlink( const char *name ) { errno = ENOSYS; return -1; }
++#endif
++
+ #include "pshpack4.h"
+ #include "poppack.h"
+ 

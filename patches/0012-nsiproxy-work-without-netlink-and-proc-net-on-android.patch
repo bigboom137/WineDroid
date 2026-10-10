@@ -1,0 +1,118 @@
+Subject: [PATCH] nsiproxy: Work without rtnetlink and /proc/net on Android.
+
+Android denies apps the rtnetlink link dump, SIOCGIFHWADDR and /proc/net.
+if_nameindex() returned NULL, update_if_table() crashed on it while holding
+if_list_lock, and every later adapter query (GetAdaptersAddresses, which
+Steam's bootstrapper calls before it downloads anything) hung for good.
+
+List interfaces with getifaddrs() and if_nametoindex() instead, tell
+loopback, point-to-point and other interfaces apart by their flags, and
+read IPv4 routes from the file named by WINEDROID_ROUTES, which the app
+writes from ConnectivityManager. Without routes there is no gateway, and
+without a gateway Windows programs think they are offline.
+---
+--- a/dlls/nsiproxy.sys/ndis.c
++++ b/dlls/nsiproxy.sys/ndis.c
+@@ -67,4 +67,8 @@
+ #endif
+ 
++#ifdef __ANDROID__
++#include <ifaddrs.h>
++#endif
++
+ #include <pthread.h>
+ 
+@@ -128,4 +132,33 @@
+ }
+ 
++static struct if_nameindex *get_if_nameindex( void )
++{
++    struct if_nameindex *ret = if_nameindex();
++#ifdef __ANDROID__
++    /* Android denies apps the rtnetlink link dump behind if_nameindex(), but
++     * getifaddrs() and SIOCGIFINDEX still work. The array is built the way
++     * bionic's if_freenameindex() frees it. */
++    struct ifaddrs *addrs, *ifa;
++    unsigned int count = 0, i, index;
++
++    if (ret) return ret;
++    if (getifaddrs( &addrs )) return calloc( 1, sizeof(*ret) );
++    for (ifa = addrs; ifa; ifa = ifa->ifa_next) count++;
++    if ((ret = calloc( count + 1, sizeof(*ret) )))
++    {
++        count = 0;
++        for (ifa = addrs; ifa; ifa = ifa->ifa_next)
++        {
++            if (!(index = if_nametoindex( ifa->ifa_name ))) continue;
++            for (i = 0; i < count; i++) if (ret[i].if_index == index) break;
++            if (i < count || !(ret[count].if_name = strdup( ifa->ifa_name ))) continue;
++            ret[count++].if_index = index;
++        }
++    }
++    freeifaddrs( addrs );
++#endif
++    return ret;
++}
++
+ #if defined (SIOCGIFHWADDR) && defined (HAVE_STRUCT_IFREQ_IFR_HWADDR)
+ static NTSTATUS if_get_physical( const char *name, UINT *type, IF_PHYSICAL_ADDRESS *phys_addr )
+@@ -163,4 +196,27 @@
+     if (ioctl( fd, SIOCGIFHWADDR, &ifr ))
+     {
++#ifdef __ANDROID__
++        /* Android denies apps the hardware address, so tell the interface
++         * kinds apart by their flags and make up a stable, locally
++         * administered address from the name */
++        if (!ioctl( fd, SIOCGIFFLAGS, &ifr ))
++        {
++            if (ifr.ifr_flags & IFF_LOOPBACK) *type = MIB_IF_TYPE_LOOPBACK;
++            else if (ifr.ifr_flags & IFF_POINTOPOINT) *type = MIB_IF_TYPE_PPP;
++            else
++            {
++                unsigned int hash = 2166136261u;
++                const char *p;
++
++                for (p = name; *p; p++) hash = (hash ^ (unsigned char)*p) * 16777619u;
++                *type = strncmp( name, "wlan", 4 ) ? MIB_IF_TYPE_ETHERNET : IF_TYPE_IEEE80211;
++                phys_addr->Length = ETH_ALEN;
++                phys_addr->Address[0] = 0x02;
++                phys_addr->Address[1] = 0x57; /* 'W' */
++                memcpy( phys_addr->Address + 2, &hash, 4 );
++            }
++            goto err;
++        }
++#endif
+         ret = STATUS_DEVICE_DATA_ERROR;
+         goto err;
+@@ -331,5 +387,5 @@
+ static unsigned int update_if_table( void )
+ {
+-    struct if_nameindex *indices = if_nameindex(), *entry;
++    struct if_nameindex *indices = get_if_nameindex(), *entry;
+     unsigned int append_count = 0;
+     struct if_entry *if_entry;
+--- a/dlls/nsiproxy.sys/ip.c
++++ b/dlls/nsiproxy.sys/ip.c
+@@ -1544,5 +1544,21 @@
+         freeifaddrs( addrs );
+ 
+-        if (!(fp = fopen( "/proc/net/route", "r" ))) return STATUS_NOT_SUPPORTED;
++        if (!(fp = fopen( "/proc/net/route", "r" )))
++        {
++#ifdef __ANDROID__
++            /* Android denies apps /proc/net, so WineDroid writes the routes
++             * it gets from ConnectivityManager in the same format */
++            const char *path = getenv( "WINEDROID_ROUTES" );
++
++            if (!path || !(fp = fopen( path, "r" )))
++            {
++                if (!want_data || num <= *count) *count = num;
++                else status = STATUS_BUFFER_OVERFLOW;
++                return status;
++            }
++#else
++            return STATUS_NOT_SUPPORTED;
++#endif
++        }
+ 
+         /* skip header line */

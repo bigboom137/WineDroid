@@ -1,0 +1,41 @@
+Subject: [PATCH] server: Save the registry periodically on Android.
+
+Proton dropped Wine's periodic registry save; the server only saves when
+it exits. Android ends apps with SIGKILL (force stop, swiping the app
+away, low memory), so the server rarely exits on its own and registry
+changes were lost: wine.inf's font entries after a prefix update, which
+left DirectWrite without Tahoma and crashed Steam's web UI, as well as
+anything programs store there. Save every 30 seconds, as upstream Wine
+does.
+---
+--- a/server/registry.c
++++ b/server/registry.c
+@@ -1890,6 +1890,17 @@ static void init_supported_machines(void)
+     native_machine = supported_machines[0];
+ }
+ 
++#ifdef __ANDROID__
++/* Android ends apps with SIGKILL (force stop, swiping the app away, low memory),
++ * so the server rarely gets to save the registry when it exits; save it
++ * every 30 seconds, as upstream Wine does */
++static void periodic_save( void *arg )
++{
++    flush_registry();
++    add_timeout_user( -30 * (timeout_t)TICKS_PER_SEC, periodic_save, NULL );
++}
++#endif
++
+ /* registry initialisation */
+ void init_registry(void)
+ {
+@@ -2029,6 +2040,10 @@ void init_registry(void)
+ 
+     /* go back to the server dir */
+     if (fchdir( server_dir_fd ) == -1) fatal_error( "chdir to server dir: %s\n", strerror( errno ));
++
++#ifdef __ANDROID__
++    add_timeout_user( -30 * (timeout_t)TICKS_PER_SEC, periodic_save, NULL );
++#endif
+ }
+ 
+ /* save a registry branch to a file */

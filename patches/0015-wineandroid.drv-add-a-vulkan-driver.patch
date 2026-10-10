@@ -1,0 +1,530 @@
+Subject: [PATCH] wineandroid.drv: Add a Vulkan driver.
+
+Vulkan surfaces are Android surfaces made on the window's client
+ANativeWindow, the same proxy window the OpenGL path renders into.
+Wine's generated Vulkan tables don't know VK_KHR_android_surface, so
+win32u enables it by name on Android in place of VK_KHR_win32_surface.
+Java creates the client surface asynchronously, so surface creation
+waits for it; until then libvulkan's connect fails with
+VK_ERROR_NATIVE_WINDOW_IN_USE_KHR.
+
+Android's libvulkan swapchain needs more of the ANativeWindow interface
+than EGL does: 64-bit usage, dataspace, shared buffer mode, auto refresh,
+dequeue timeout, refresh duration, consumer usage and frame ids, plus
+the usage64 and layerCount fields of window buffers. Android 17 also
+connects with op 57 (connect with listener, no listener given), sets a
+present mode (53) and on-acquired/dropped callbacks (55/56); those
+aren't in AOSP yet and were read from the device's libvulkan. The proxy
+forwards the setters and answers the getters itself; callbacks can't
+cross processes and are ignored. A swapchain keeps all its buffers, so
+the buffer cache grows to 8 and the max buffer count it reports is
+clamped to that.
+
+The window surface clip that leaves the client area transparent is
+applied when wineandroid.drv copies to the Android buffer, so win32u
+now redraws the whole surface when the clip changes; otherwise what was
+painted before the client surface appeared kept hiding it.
+---
+--- a/dlls/wineandroid.drv/Makefile.in
++++ b/dlls/wineandroid.drv/Makefile.in
+@@ -10,6 +10,7 @@
+ 	init.c \
+ 	keyboard.c \
+ 	opengl.c \
++	vulkan.c \
+ 	window.c \
+ 	wine.svg
+ 
+--- a/dlls/wineandroid.drv/android.h
++++ b/dlls/wineandroid.drv/android.h
+@@ -57,6 +57,14 @@
+ 
+ 
+ /**************************************************************************
++ * Vulkan driver
++ */
++
++struct vulkan_driver_funcs;
++extern UINT ANDROID_VulkanInit( UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs );
++
++
++/**************************************************************************
+  * Android pseudo-device
+  */
+ 
+--- a/dlls/wineandroid.drv/android_native.h
++++ b/dlls/wineandroid.drv/android_native.h
+@@ -61,9 +61,11 @@
+     int stride;
+     int format;
+     int usage;
+-    void *reserved[2];
++    uintptr_t layerCount;
++    void *reserved[1];
+     buffer_handle_t handle;
+-    void *reserved_proc[8];
++    uint64_t usage64;
++    void *reserved_proc[7];
+ };
+ 
+ struct ANativeWindow
+@@ -98,7 +100,19 @@
+     NATIVE_WINDOW_DEFAULT_WIDTH             = 6,
+     NATIVE_WINDOW_DEFAULT_HEIGHT            = 7,
+     NATIVE_WINDOW_TRANSFORM_HINT            = 8,
+-    NATIVE_WINDOW_CONSUMER_RUNNING_BEHIND   = 9
++    NATIVE_WINDOW_CONSUMER_RUNNING_BEHIND   = 9,
++    NATIVE_WINDOW_CONSUMER_USAGE_BITS       = 10,
++    NATIVE_WINDOW_STICKY_TRANSFORM          = 11,
++    NATIVE_WINDOW_DEFAULT_DATASPACE         = 12,
++    NATIVE_WINDOW_BUFFER_AGE                = 13,
++    NATIVE_WINDOW_LAST_DEQUEUE_DURATION     = 14,
++    NATIVE_WINDOW_LAST_QUEUE_DURATION       = 15,
++    NATIVE_WINDOW_LAYER_COUNT               = 16,
++    NATIVE_WINDOW_IS_VALID                  = 17,
++    NATIVE_WINDOW_FRAME_TIMESTAMPS_SUPPORTS_PRESENT = 18,
++    NATIVE_WINDOW_CONSUMER_IS_PROTECTED     = 19,
++    NATIVE_WINDOW_DATASPACE                 = 20,
++    NATIVE_WINDOW_MAX_BUFFER_COUNT          = 21
+ };
+ 
+ enum native_window_perform
+@@ -119,7 +133,32 @@
+     NATIVE_WINDOW_API_CONNECT                 = 13,
+     NATIVE_WINDOW_API_DISCONNECT              = 14,
+     NATIVE_WINDOW_SET_BUFFERS_USER_DIMENSIONS = 15,
+-    NATIVE_WINDOW_SET_POST_TRANSFORM_CROP     = 16
++    NATIVE_WINDOW_SET_POST_TRANSFORM_CROP     = 16,
++    NATIVE_WINDOW_SET_BUFFERS_STICKY_TRANSFORM = 17,
++    NATIVE_WINDOW_SET_SIDEBAND_STREAM         = 18,
++    NATIVE_WINDOW_SET_BUFFERS_DATASPACE       = 19,
++    NATIVE_WINDOW_SET_SURFACE_DAMAGE          = 20,
++    NATIVE_WINDOW_SET_SHARED_BUFFER_MODE      = 21,
++    NATIVE_WINDOW_SET_AUTO_REFRESH            = 22,
++    NATIVE_WINDOW_GET_REFRESH_CYCLE_DURATION  = 23,
++    NATIVE_WINDOW_GET_NEXT_FRAME_ID           = 24,
++    NATIVE_WINDOW_ENABLE_FRAME_TIMESTAMPS     = 25,
++    NATIVE_WINDOW_GET_COMPOSITOR_TIMING       = 26,
++    NATIVE_WINDOW_GET_FRAME_TIMESTAMPS        = 27,
++    NATIVE_WINDOW_SET_USAGE64                 = 30,
++    NATIVE_WINDOW_GET_CONSUMER_USAGE64        = 31,
++    NATIVE_WINDOW_SET_BUFFERS_SMPTE2086_METADATA = 32,
++    NATIVE_WINDOW_SET_BUFFERS_CTA861_3_METADATA = 33,
++    NATIVE_WINDOW_SET_BUFFERS_HDR10_PLUS_METADATA = 34,
++    NATIVE_WINDOW_SET_AUTO_PREROTATION        = 35,
++    NATIVE_WINDOW_SET_DEQUEUE_TIMEOUT         = 37,
++    NATIVE_WINDOW_SET_FRAME_RATE              = 40,
++    /* Android 17, not in AOSP yet; arguments taken from libvulkan */
++    NATIVE_WINDOW_SET_PRESENT_MODE            = 53,  /* int mode */
++    NATIVE_WINDOW_GET_LAST_ACQUIRED           = 54,  /* uint64_t * */
++    NATIVE_WINDOW_SET_ON_ACQUIRED_CALLBACK    = 55,  /* callback, context */
++    NATIVE_WINDOW_SET_ON_DROPPED_CALLBACK     = 56,  /* callback, context */
++    NATIVE_WINDOW_API_CONNECT_WITH_LISTENER   = 57   /* int api, listener, int, int */
+ };
+ 
+ enum native_window_api
+--- a/dlls/wineandroid.drv/device.c
++++ b/dlls/wineandroid.drv/device.c
+@@ -72,7 +72,7 @@
+     NB_IOCTLS
+ };
+ 
+-#define NB_CACHED_BUFFERS 4
++#define NB_CACHED_BUFFERS 8
+ 
+ struct native_buffer_wrapper;
+ 
+@@ -107,6 +107,7 @@
+     HWND                          hwnd;
+     BOOL                          opengl;
+     LONG                          ref;
++    uint64_t                      frame_id;
+ };
+ 
+ /* wrapper for a native buffer in the context of the client (non-Java) process */
+@@ -961,10 +962,20 @@
+     case NATIVE_WINDOW_SET_USAGE:
+     case NATIVE_WINDOW_SET_BUFFERS_TRANSFORM:
+     case NATIVE_WINDOW_SET_SCALING_MODE:
++    case NATIVE_WINDOW_SET_BUFFERS_DATASPACE:
++    case NATIVE_WINDOW_SET_SHARED_BUFFER_MODE:
++    case NATIVE_WINDOW_SET_AUTO_REFRESH:
++    case NATIVE_WINDOW_SET_AUTO_PREROTATION:
++    case NATIVE_WINDOW_SET_PRESENT_MODE:
+         wrap_java_call();
+         ret = parent->perform( parent, res->operation, res->args[0] );
+         unwrap_java_call();
+         break;
++    case NATIVE_WINDOW_SET_USAGE64:
++        wrap_java_call();
++        ret = parent->perform( parent, res->operation, (uint64_t)(unsigned int)res->args[0] | ((uint64_t)res->args[1] << 32) );
++        unwrap_java_call();
++        break;
+     case NATIVE_WINDOW_SET_BUFFER_COUNT:
+         wrap_java_call();
+         ret = parent->perform( parent, res->operation, (size_t)res->args[0] );
+@@ -983,7 +994,7 @@
+         break;
+     case NATIVE_WINDOW_SET_BUFFERS_TIMESTAMP:
+         wrap_java_call();
+-        ret = parent->perform( parent, res->operation, res->args[0] | ((int64_t)res->args[1] << 32) );
++        ret = parent->perform( parent, res->operation, (int64_t)((uint64_t)(unsigned int)res->args[0] | ((uint64_t)res->args[1] << 32)) );
+         unwrap_java_call();
+         break;
+     case NATIVE_WINDOW_CONNECT:
+@@ -1310,6 +1321,8 @@
+         buf->buffer.stride         = res.stride;
+         buf->buffer.format         = res.format;
+         buf->buffer.usage          = res.usage;
++        buf->buffer.usage64        = (unsigned int)res.usage;
++        buf->buffer.layerCount     = 1;
+         buf->buffer.handle         = unmap_native_handle( &res.native_handle.handle );
+         buf->ref                   = 1;
+         buf->hwnd                  = win->hwnd;
+@@ -1420,13 +1433,22 @@
+     DWORD size = sizeof( query );
+     int ret;
+ 
++    if (what == NATIVE_WINDOW_FRAME_TIMESTAMPS_SUPPORTS_PRESENT)
++    {
++        *value = 0;  /* frame timestamps aren't forwarded */
++        return 0;
++    }
++
+     query.hdr.hwnd = HandleToLong( win->hwnd );
+     query.hdr.opengl = win->opengl;
+     query.what = what;
+     ret = android_ioctl( IOCTL_QUERY, &query, sizeof(query), &query, &size );
+     TRACE( "hwnd %p what %d got %d -> %p\n", win->hwnd, what, query.value, value );
+-    if (!ret) *value = query.value;
+-    return ret;
++    if (ret) return ret;
++    /* every buffer of a window must fit in the buffer cache */
++    if (what == NATIVE_WINDOW_MAX_BUFFER_COUNT) query.value = min( query.value, NB_CACHED_BUFFERS );
++    *value = query.value;
++    return 0;
+ }
+ 
+ static int perform( ANativeWindow *window, int operation, ... )
+@@ -1460,6 +1482,63 @@
+         perf.args[0] = va_arg( args, int );
+         TRACE( "hwnd %p %s arg %d\n", win->hwnd, names[operation], perf.args[0] );
+         break;
++    /* used by the Vulkan swapchain */
++    case NATIVE_WINDOW_SET_BUFFERS_DATASPACE:
++    case NATIVE_WINDOW_SET_SHARED_BUFFER_MODE:
++    case NATIVE_WINDOW_SET_AUTO_REFRESH:
++    case NATIVE_WINDOW_SET_AUTO_PREROTATION:
++    case NATIVE_WINDOW_SET_PRESENT_MODE:
++        perf.args[0] = va_arg( args, int );
++        TRACE( "hwnd %p op %d arg %d\n", win->hwnd, operation, perf.args[0] );
++        break;
++    case NATIVE_WINDOW_API_CONNECT_WITH_LISTENER:
++    {
++        /* api, listener, two flags; libvulkan passes no listener, so it's a plain connect */
++        perf.args[0] = va_arg( args, int );
++        if (va_arg( args, void * )) FIXME( "hwnd %p connect listener not supported\n", win->hwnd );
++        perf.operation = NATIVE_WINDOW_API_CONNECT;
++        TRACE( "hwnd %p API_CONNECT_WITH_LISTENER arg %d\n", win->hwnd, perf.args[0] );
++        break;
++    }
++    case NATIVE_WINDOW_SET_USAGE64:
++    {
++        uint64_t usage = va_arg( args, uint64_t );
++        perf.args[0] = usage;
++        perf.args[1] = usage >> 32;
++        TRACE( "hwnd %p SET_USAGE64 %#llx\n", win->hwnd, (unsigned long long)usage );
++        break;
++    }
++    case NATIVE_WINDOW_GET_CONSUMER_USAGE64:
++        /* what SurfaceFlinger asks for */
++        *va_arg( args, uint64_t * ) = GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_COMPOSER;
++        va_end( args );
++        return 0;
++    case NATIVE_WINDOW_GET_REFRESH_CYCLE_DURATION:
++        *va_arg( args, int64_t * ) = 16666667;  /* 60Hz */
++        va_end( args );
++        return 0;
++    case NATIVE_WINDOW_GET_NEXT_FRAME_ID:
++        *va_arg( args, uint64_t * ) = ++win->frame_id;
++        va_end( args );
++        return 0;
++    case NATIVE_WINDOW_GET_COMPOSITOR_TIMING:
++    case NATIVE_WINDOW_GET_FRAME_TIMESTAMPS:
++    case NATIVE_WINDOW_GET_LAST_ACQUIRED:
++        va_end( args );
++        return -ENOSYS;
++    case NATIVE_WINDOW_ENABLE_FRAME_TIMESTAMPS:
++    case NATIVE_WINDOW_SET_DEQUEUE_TIMEOUT:
++    case NATIVE_WINDOW_SET_SURFACE_DAMAGE:
++    case NATIVE_WINDOW_SET_BUFFERS_SMPTE2086_METADATA:
++    case NATIVE_WINDOW_SET_BUFFERS_CTA861_3_METADATA:
++    case NATIVE_WINDOW_SET_BUFFERS_HDR10_PLUS_METADATA:
++    case NATIVE_WINDOW_SET_FRAME_RATE:
++    case NATIVE_WINDOW_SET_ON_ACQUIRED_CALLBACK:  /* callbacks can't cross processes */
++    case NATIVE_WINDOW_SET_ON_DROPPED_CALLBACK:
++        /* hints that don't need to reach the real window */
++        TRACE( "hwnd %p ignoring op %d\n", win->hwnd, operation );
++        va_end( args );
++        return 0;
+     case NATIVE_WINDOW_SET_BUFFER_COUNT:
+         perf.args[0] = va_arg( args, size_t );
+         TRACE( "hwnd %p %s count %d\n", win->hwnd, names[operation], perf.args[0] );
+--- a/dlls/wineandroid.drv/init.c
++++ b/dlls/wineandroid.drv/init.c
+@@ -329,6 +329,7 @@
+     .pCreateWindowSurface = ANDROID_CreateWindowSurface,
+     .pWindowPosChanged = ANDROID_WindowPosChanged,
+     .pOpenGLInit = ANDROID_OpenGLInit,
++    .pVulkanInit = ANDROID_VulkanInit,
+ };
+ 
+ 
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -702,6 +702,12 @@
+         }
+     }
+ 
++#ifdef __ANDROID__
++    /* wineandroid.drv applies the clip when copying to the Android buffer, so redraw it all;
++     * otherwise what was painted before a client surface (OpenGL, Vulkan) appeared hides it */
++    SetRect( &surface->bounds, 0, 0, surface->rect.right - surface->rect.left,
++             surface->rect.bottom - surface->rect.top );
++#endif
+     window_surface_unlock( surface );
+ }
+ 
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -411,6 +411,9 @@
+     const VkDebugReportCallbackCreateInfoEXT *debug_report_callback;
+     const char **extensions;
+     uint32_t count = 0;
++#ifdef __ANDROID__
++    BOOL android_surface;
++#endif
+ 
+     while ((header = find_next_struct( header->pNext, VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT )))
+     {
+@@ -437,6 +440,10 @@
+         return VK_ERROR_LAYER_NOT_PRESENT;
+     }
+ 
++#ifdef __ANDROID__
++    /* the generated tables don't know VK_KHR_android_surface, so it's added by name below */
++    android_surface = instance->obj.extensions.has_VK_KHR_win32_surface;
++#endif
+     driver_funcs->p_map_instance_extensions( &instance->obj.extensions );
+     instance->obj.extensions.has_VK_KHR_win32_surface = 0;
+ 
+@@ -462,6 +469,9 @@
+ #define USE_VK_EXT(x) if (instance->obj.extensions.has_ ## x) extensions[count++] = #x;
+     ALL_VK_INSTANCE_EXTS
+ #undef USE_VK_EXT
++#ifdef __ANDROID__
++    if (android_surface) extensions[count++] = "VK_KHR_android_surface";
++#endif
+ 
+     TRACE( "Enabling %u host instance extensions\n", count );
+     for (const char **extension = extensions, **end = extension + count; extension < end; extension++)
+--- a/dlls/wineandroid.drv/vulkan.c
++++ b/dlls/wineandroid.drv/vulkan.c
+@@ -0,0 +1,197 @@
++/*
++ * Android Vulkan driver
++ *
++ * Copyright 2026 WineDroid contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <errno.h>
++#include <stdarg.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <dlfcn.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "android.h"
++
++#include "wine/vulkan.h"
++#include "wine/vulkan_driver.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
++
++/* Wine's generated Vulkan headers leave out the Android platform */
++#define VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR 1000008000
++
++typedef struct VkAndroidSurfaceCreateInfoKHR
++{
++    VkStructureType sType;
++    const void *pNext;
++    VkAndroidSurfaceCreateFlagsKHR flags;
++    struct ANativeWindow *window;
++} VkAndroidSurfaceCreateInfoKHR;
++
++typedef VkResult (VKAPI_PTR *PFN_vkCreateAndroidSurfaceKHR)( VkInstance, const VkAndroidSurfaceCreateInfoKHR *,
++                                                             const VkAllocationCallbacks *, VkSurfaceKHR * );
++
++static PFN_vkGetInstanceProcAddr p_vkGetInstanceProcAddr;
++static const struct client_surface_funcs android_vulkan_surface_funcs;
++
++struct android_vulkan_surface
++{
++    struct client_surface client;
++    ANativeWindow *window;
++};
++
++static struct android_vulkan_surface *impl_from_client_surface( struct client_surface *client )
++{
++    return CONTAINING_RECORD( client, struct android_vulkan_surface, client );
++}
++
++static VkResult android_vulkan_surface_create( HWND hwnd, const struct vulkan_instance *instance, VkSurfaceKHR *handle,
++                                               struct client_surface **client )
++{
++    VkAndroidSurfaceCreateInfoKHR info = { .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR };
++    PFN_vkCreateAndroidSurfaceKHR p_vkCreateAndroidSurfaceKHR;
++    struct android_vulkan_surface *surface;
++    VkResult res;
++
++    TRACE( "%p %p %p %p\n", hwnd, instance, handle, client );
++
++    p_vkCreateAndroidSurfaceKHR = (PFN_vkCreateAndroidSurfaceKHR)p_vkGetInstanceProcAddr( instance->host.instance,
++                                                                                          "vkCreateAndroidSurfaceKHR" );
++    if (!p_vkCreateAndroidSurfaceKHR)
++    {
++        ERR( "vkCreateAndroidSurfaceKHR is not available\n" );
++        return VK_ERROR_EXTENSION_NOT_PRESENT;
++    }
++
++    if (!(surface = client_surface_create( sizeof(*surface), &android_vulkan_surface_funcs, hwnd )))
++        return VK_ERROR_OUT_OF_HOST_MEMORY;
++    if (!(surface->window = get_client_window( hwnd )))
++    {
++        client_surface_release( &surface->client );
++        return VK_ERROR_OUT_OF_HOST_MEMORY;
++    }
++
++    /* Java creates the client surface asynchronously; until then the window answers -EAGAIN,
++     * which makes libvulkan's connect fail with VK_ERROR_NATIVE_WINDOW_IN_USE_KHR */
++    for (int i = 0, value; i < 200; i++)
++    {
++        if (surface->window->query( surface->window, NATIVE_WINDOW_DEFAULT_WIDTH, &value ) != -EAGAIN) break;
++        usleep( 10000 );
++    }
++
++    info.window = surface->window;
++    if ((res = p_vkCreateAndroidSurfaceKHR( instance->host.instance, &info, NULL /* allocator */, handle )))
++    {
++        ERR( "Failed to create Android surface, res %d\n", res );
++        client_surface_release( &surface->client );
++        return res;
++    }
++
++    *client = &surface->client;
++    TRACE( "Created surface 0x%s, client %s, window %p\n", wine_dbgstr_longlong( *handle ),
++           debugstr_client_surface( *client ), surface->window );
++    return VK_SUCCESS;
++}
++
++static VkBool32 android_get_physical_device_presentation_support( struct vulkan_physical_device *physical_device, uint32_t index )
++{
++    /* every queue family can present on Android */
++    return VK_TRUE;
++}
++
++static void android_map_instance_extensions( struct vulkan_instance_extensions *extensions )
++{
++    /* Android's loader always has VK_KHR_android_surface, which win32u enables in place of
++     * VK_KHR_win32_surface since its generated tables don't know about it */
++    if (extensions->has_VK_KHR_surface) extensions->has_VK_KHR_win32_surface = 1;
++}
++
++static void android_map_device_extensions( struct vulkan_device_extensions *extensions )
++{
++    if (extensions->has_VK_KHR_external_memory_win32) extensions->has_VK_KHR_external_memory_fd = 1;
++    if (extensions->has_VK_KHR_external_memory_fd) extensions->has_VK_KHR_external_memory_win32 = 1;
++    if (extensions->has_VK_KHR_external_semaphore_win32) extensions->has_VK_KHR_external_semaphore_fd = 1;
++    if (extensions->has_VK_KHR_external_semaphore_fd) extensions->has_VK_KHR_external_semaphore_win32 = 1;
++    if (extensions->has_VK_KHR_external_fence_win32) extensions->has_VK_KHR_external_fence_fd = 1;
++    if (extensions->has_VK_KHR_external_fence_fd) extensions->has_VK_KHR_external_fence_win32 = 1;
++}
++
++static void android_vulkan_surface_destroy( struct client_surface *client )
++{
++    struct android_vulkan_surface *surface = impl_from_client_surface( client );
++
++    TRACE( "%s\n", debugstr_client_surface( client ) );
++    if (surface->window) release_ioctl_window( surface->window );
++}
++
++static void android_vulkan_surface_detach( struct client_surface *client )
++{
++}
++
++static void android_vulkan_surface_update( struct client_surface *client )
++{
++}
++
++static void android_vulkan_surface_present( struct client_surface *client, HDC hdc )
++{
++}
++
++static const struct client_surface_funcs android_vulkan_surface_funcs =
++{
++    .destroy = android_vulkan_surface_destroy,
++    .detach = android_vulkan_surface_detach,
++    .update = android_vulkan_surface_update,
++    .present = android_vulkan_surface_present,
++};
++
++static const struct vulkan_driver_funcs android_vulkan_driver_funcs =
++{
++    .p_vulkan_surface_create = android_vulkan_surface_create,
++    .p_get_physical_device_presentation_support = android_get_physical_device_presentation_support,
++    .p_map_instance_extensions = android_map_instance_extensions,
++    .p_map_device_extensions = android_map_device_extensions,
++};
++
++/**********************************************************************
++ *           ANDROID_VulkanInit
++ */
++UINT ANDROID_VulkanInit( UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs )
++{
++    if (version != WINE_VULKAN_DRIVER_VERSION)
++    {
++        ERR( "version mismatch, win32u wants %u but driver has %u\n", version, WINE_VULKAN_DRIVER_VERSION );
++        return STATUS_INVALID_PARAMETER;
++    }
++
++    if (!(p_vkGetInstanceProcAddr = dlsym( vulkan_handle, "vkGetInstanceProcAddr" )))
++    {
++        ERR( "Failed to find vkGetInstanceProcAddr\n" );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++
++    *driver_funcs = &android_vulkan_driver_funcs;
++    return STATUS_SUCCESS;
++}
