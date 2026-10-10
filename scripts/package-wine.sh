@@ -4,6 +4,9 @@
 # usage: scripts/package-wine.sh <wine build dir> <android deps prefix> [runtime]
 #
 # Set DXVK_DIR to an unpacked DXVK release (with x64/ and x32/) to bundle it.
+# Set MONO_DIR to an unpacked wine-mono release (wine-mono-<version>, the one
+# dlls/mscoree expects) to bundle it; .NET programs (XNA/FNA games such as
+# Celeste) need it.
 # Set LIBERATION_DIR to the unpacked liberation-fonts-ttf release to add Arial,
 # Times New Roman and Courier New built from it (needs fontTools, e.g. on
 # PYTHONPATH).
@@ -49,6 +52,13 @@ if [ -n "$DXVK_DIR" ]; then
     cp -r "$DXVK_DIR/x64" "$DXVK_DIR/x32" "$ASSETS/share/dxvk/"
 fi
 
+# Wine Mono, found by mscoree in <data dir>/mono/wine-mono-<version>
+if [ -n "$MONO_DIR" ]; then
+    echo "Adding Wine Mono from $MONO_DIR"
+    mkdir -p "$ASSETS/share/wine/mono"
+    cp -a "$MONO_DIR" "$ASSETS/share/wine/mono/"
+fi
+
 # Fonts that wine.inf registers and Windows programs expect (WineActivity
 # copies them into the prefix's Fonts directory)
 if [ -n "$LIBERATION_DIR" ]; then
@@ -59,7 +69,7 @@ fi
 # WineActivity extracts the assets listed in files.sum and re-extracts only
 # what changed, using sums.sum to detect a new build.
 (cd "$ASSETS" &&
- find x86_64 share -type f -print | LC_ALL=C sort | xargs sha256sum > files.sum &&
+ find x86_64 share -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > files.sum &&
  sha256sum files.sum > sums.sum)
 
 echo "Copying native libraries"

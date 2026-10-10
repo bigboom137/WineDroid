@@ -1,0 +1,20 @@
+Subject: [PATCH] explorer: Do not show the standalone systray on Android.
+
+Android has no host systray to dock icons into, so the standalone systray
+window floated over the top left corner of every program. It can still be
+turned on with the ShowSystray setting.
+---
+--- a/programs/explorer/desktop.c
++++ b/programs/explorer/desktop.c
+@@ -979,6 +979,11 @@
+         RegCloseKey( hkey );
+     }
+ 
++#ifdef __ANDROID__
++    /* Android has no host systray to dock into, so the standalone systray window
++     * would float over the top left corner of every program */
++    if (!found) return FALSE;
++#endif
+     /* Default on */
+     if (!found) result = TRUE;
+     return result;

@@ -35,6 +35,8 @@ wine)
         case $WINE_VERSION in *.0) dir=$WINE_VERSION ;; *) dir=$major.x ;; esac
         curl -sL "https://dl.winehq.org/wine/source/$dir/wine-$WINE_VERSION.tar.xz" | tar xJ
         for p in "$ROOT"/patches/*.patch; do patch -d $SRC -p1 < "$p"; done
+        # patches add DLLs (wineaaudio.drv) to configure.ac
+        (cd $SRC && autoreconf -if && rm -rf autom4te.cache)
     fi
     ;;
 proton)

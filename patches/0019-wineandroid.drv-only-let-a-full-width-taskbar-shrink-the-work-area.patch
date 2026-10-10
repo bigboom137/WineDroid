@@ -1,0 +1,21 @@
+Subject: [PATCH] wineandroid.drv: Only let a full-width taskbar shrink the work area.
+
+Explorer's standalone systray window is a Shell_TrayWnd too. With it at
+the top of the screen, the work area started below it, and maximized
+windows (Steam's) left a white strip above them.
+---
+--- a/dlls/wineandroid.drv/init.c
++++ b/dlls/wineandroid.drv/init.c
+@@ -77,8 +77,11 @@
+     virtual_screen_rect.bottom = height;
+     monitor_rc_work = virtual_screen_rect;
+ 
++    /* only a taskbar spanning the screen takes space from the work area, not the
++     * standalone systray window, or maximized windows leave a strip next to it */
+     if (hwnd && NtUserIsWindowVisible( hwnd ) &&
+-        NtUserGetWindowRect( hwnd, &rect, NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ) ))
++        NtUserGetWindowRect( hwnd, &rect, NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ) ) &&
++        rect.right - rect.left >= width)
+     {
+         if (rect.top) monitor_rc_work.bottom = rect.top;
+         else monitor_rc_work.top = rect.bottom;

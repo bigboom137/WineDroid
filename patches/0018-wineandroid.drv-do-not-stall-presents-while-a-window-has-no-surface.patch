@@ -1,0 +1,26 @@
+Subject: [PATCH] wineandroid.drv: Do not stall presents while a window has no surface.
+
+Creating a Vulkan surface waited up to two seconds for Java to deliver
+the window's Android surface. A hidden window gets none until it is
+shown, and DXVK tries to create the surface again on every present, so
+each present of a hidden window blocked for two seconds. Chromium's GPU
+process draws all of Steam's windows, so the whole UI crawled and Steam
+killed the main window's browser as unresponsive, leaving it black.
+Wait at most 50 ms.
+---
+--- a/dlls/wineandroid.drv/vulkan.c
++++ b/dlls/wineandroid.drv/vulkan.c
+@@ -95,8 +95,11 @@
+     }
+ 
+     /* Java creates the client surface asynchronously; until then the window answers -EAGAIN,
+-     * which makes libvulkan's connect fail with VK_ERROR_NATIVE_WINDOW_IN_USE_KHR */
+-    for (int i = 0, value; i < 200; i++)
++     * which makes libvulkan's connect fail with VK_ERROR_NATIVE_WINDOW_IN_USE_KHR. Give it a
++     * moment, but no more: a hidden window gets no surface until it is shown, and DXVK tries
++     * again on each present, so a long wait stalled every present (Chromium's GPU process
++     * draws all of Steam's windows, and Steam killed them as unresponsive) */
++    for (int i = 0, value; i < 5; i++)
+     {
+         if (surface->window->query( surface->window, NATIVE_WINDOW_DEFAULT_WIDTH, &value ) != -EAGAIN) break;
+         usleep( 10000 );

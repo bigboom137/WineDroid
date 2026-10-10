@@ -43,6 +43,10 @@ import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.PointerIcon;
+import android.graphics.PixelFormat;
+import android.hardware.HardwareBuffer;
+import android.media.ImageReader;
+import android.media.Image;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -56,6 +60,7 @@ import android.view.TextureView;
 import android.view.View;
 import android.view.ViewGroup;
 import java.io.BufferedReader;
+import java.io.FileReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -310,9 +315,44 @@ public class WineActivity extends Activity
         return "";
     }
 
+    /* Kill what is left of an earlier Wine session: Android's force stop can miss a
+     * Windows process whose main thread has exited while others still run (a Steam
+     * controller thread kept a CPU core busy for an hour that way). Wine isn't running
+     * yet, so no other process of this app should exist. */
+    private void killStaleProcesses()
+    {
+        int my_pid = android.os.Process.myPid();
+        int my_uid = android.os.Process.myUid();
+        File[] procs = new File( "/proc" ).listFiles();
+        if (procs == null) return;
+        for (File dir : procs)
+        {
+            int pid;
+            try { pid = Integer.parseInt( dir.getName() ); }
+            catch (NumberFormatException e) { continue; }
+            if (pid == my_pid) continue;
+            try (BufferedReader reader = new BufferedReader( new FileReader( new File( dir, "status" ))))
+            {
+                String line;
+                while ((line = reader.readLine()) != null)
+                {
+                    if (!line.startsWith( "Uid:" )) continue;
+                    if (Integer.parseInt( line.split( "\\s+" )[1] ) == my_uid)
+                    {
+                        Log.w( LOGTAG, "killing stale process " + pid );
+                        android.os.Process.killProcess( pid );
+                    }
+                    break;
+                }
+            }
+            catch (IOException | NumberFormatException e) {}
+        }
+    }
+
     private void loadWine( String cmdline )
     {
         copyAssetFiles();
+        killStaleProcesses();
 
         String wine_abi = get_wine_abi();
         File bindir = new File( getRuntimeDir(), wine_abi + "/bin" );
@@ -685,6 +725,11 @@ public class WineActivity extends Activity
             runOnUiThread( new Runnable() { public void run() {
                 progress_dialog.incrementProgressBy( 1 ); }});
         }
+        /* a new runtime may bring new builtin DLLs (an audio driver), which the prefix
+         * only gets placeholders for when it is updated, and Wine updates it only
+         * when wine.inf changes */
+        new File( getRuntimeDir(), "prefix/.update-timestamp" ).delete();
+
         /* only now, so that an interrupted extraction is redone */
         prefs.edit().putString( key, new_sum ).apply();
     }
@@ -716,6 +761,7 @@ public class WineActivity extends Activity
         protected SurfaceTexture client_surftex;
         protected WineWindowGroup window_group;
         protected WineWindowGroup client_group;
+        protected ImageReader placeholder;
 
         public WineWindow( int w, WineWindow parent, float scale )
         {
@@ -736,9 +782,10 @@ public class WineActivity extends Activity
         {
             Log.i( LOGTAG, String.format( "destroy hwnd %08x", hwnd ));
             visible = false;
-            win_map.remove( this );
+            win_map.remove( hwnd );
             if (parent != null) parent.children.remove( this );
             destroy_window_groups();
+            destroy_placeholder();
         }
 
         public WineWindowGroup create_window_groups()
@@ -789,6 +836,7 @@ public class WineActivity extends Activity
             if (client_group != null) client_group.destroy_view();
             client_surface = null;
             client_surftex = null;
+            destroy_placeholder();
         }
 
         public void create_client_view()
@@ -797,6 +845,7 @@ public class WineActivity extends Activity
             Log.i( LOGTAG, String.format( "creating client view %08x %s", hwnd, client_rect ));
             client_group.create_view( true ).layout( 0, 0, client_rect.right - client_rect.left,
                                                      client_rect.bottom - client_rect.top );
+            if (client_surface == null) set_client_surface( placeholder_surface() );
         }
 
         protected void add_view_to_parent()
@@ -944,6 +993,39 @@ public class WineActivity extends Activity
             update_surface( is_client );
         }
 
+        /* Programs create their OpenGL or Vulkan surface before showing the window
+         * (SDL, FNA3D), but a SurfaceView only has a surface while it is shown; until
+         * then, and while hidden, they draw into this undisplayed one */
+        public Surface placeholder_surface()
+        {
+            if (placeholder == null)
+            {
+                int width = Math.max( 1, client_rect.right - client_rect.left );
+                int height = Math.max( 1, client_rect.bottom - client_rect.top );
+                if (Build.VERSION.SDK_INT >= 29)
+                    placeholder = ImageReader.newInstance( width, height, PixelFormat.RGBA_8888, 3,
+                                                           HardwareBuffer.USAGE_GPU_COLOR_OUTPUT |
+                                                           HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE );
+                else
+                    placeholder = ImageReader.newInstance( width, height, PixelFormat.RGBA_8888, 3 );
+                placeholder.setOnImageAvailableListener( new ImageReader.OnImageAvailableListener() {
+                    public void onImageAvailable( ImageReader reader )
+                    {
+                        Image image = reader.acquireLatestImage();  // nobody looks at it
+                        if (image != null) image.close();
+                    }}, null );
+                Log.i( LOGTAG, String.format( "placeholder client surface %08x %dx%d", hwnd, width, height ));
+            }
+            return placeholder.getSurface();
+        }
+
+        public void destroy_placeholder()
+        {
+            if (placeholder == null) return;
+            placeholder.close();
+            placeholder = null;
+        }
+
         public void set_client_surface( Surface surface )
         {
             client_surftex = null;
@@ -1077,7 +1159,8 @@ public class WineActivity extends Activity
         public void surfaceDestroyed( SurfaceHolder holder )
         {
             Log.i( LOGTAG, String.format( "surfaceDestroyed win %08x client", window.hwnd ));
-            window.set_client_surface( null );
+            if (WineActivity.this.get_window( window.hwnd ) == window) window.set_client_surface( window.placeholder_surface() );
+            else window.set_client_surface( null );
         }
     }
 

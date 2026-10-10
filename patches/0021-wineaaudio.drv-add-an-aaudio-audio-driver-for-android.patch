@@ -1,0 +1,1649 @@
+Subject: [PATCH] wineaaudio.drv: Add an AAudio audio driver for Android.
+
+Wine's Android build had no audio driver since the OpenSL ES one was
+dropped, so every program was silent ("No driver from pulse,alsa,oss,
+coreaudio could be initialized"). Add one based on the OSS driver: its
+ring buffer and timer loop feed an AAudio output stream (shared,
+low-latency, game usage) through non-blocking writes; AAudio converts
+sample rates and channel counts, so only the sample format limits what
+is supported. The stream is reopened when the output disconnects
+(headphones, Bluetooth). Render only, no capture or volume control yet;
+no MIDI or aux devices. mmdevapi tries it first.
+---
+diff --git a/configure.ac b/configure.ac
+index b8ae3db..f54c2f9 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -998,6 +998,7 @@ case $host_os in
+     LDDLLFLAGS="-fPIC"
+     LDEXECFLAGS="-Wl,-pie"
+     enable_wineandroid_drv=${enable_wineandroid_drv:-yes}
++    enable_wineaaudio_drv=${enable_wineaaudio_drv:-yes}
+     WINE_TRY_CFLAGS([-Wl,-z,defs],[UNIXLDFLAGS="$UNIXLDFLAGS -Wl,-z,defs"])
+     WINE_TRY_CFLAGS([-fPIC -Wl,--export-dynamic],[WINELOADER_LDFLAGS="-Wl,--export-dynamic"])
+     WINEPRELOADER_LDFLAGS="-static -nostartfiles -nodefaultlibs -Wl,-Ttext=0x7d400000"
+@@ -1071,6 +1072,7 @@ esac
+ 
+ enable_winecoreaudio_drv=${enable_winecoreaudio_drv:-no}
+ enable_wineandroid_drv=${enable_wineandroid_drv:-no}
++enable_wineaaudio_drv=${enable_wineaaudio_drv:-no}
+ enable_winemac_drv=${enable_winemac_drv:-no}
+ 
+ dnl **** External libraries ****
+@@ -3353,6 +3355,7 @@ WINE_CONFIG_MAKEFILE(dlls/windowscodecs)
+ WINE_CONFIG_MAKEFILE(dlls/windowscodecs/tests)
+ WINE_CONFIG_MAKEFILE(dlls/windowscodecsext)
+ WINE_CONFIG_MAKEFILE(dlls/windowscodecsext/tests)
++WINE_CONFIG_MAKEFILE(dlls/wineaaudio.drv)
+ WINE_CONFIG_MAKEFILE(dlls/winealsa.drv)
+ WINE_CONFIG_MAKEFILE(dlls/wineandroid.drv)
+ WINE_CONFIG_MAKEFILE(dlls/winebth.sys)
+diff --git a/dlls/mmdevapi/main.c b/dlls/mmdevapi/main.c
+index 66a6327..ba71244 100644
+--- a/dlls/mmdevapi/main.c
++++ b/dlls/mmdevapi/main.c
+@@ -125,7 +125,7 @@ fail:
+ 
+ static BOOL WINAPI init_driver(INIT_ONCE *once, void *param, void **context)
+ {
+-    static WCHAR default_list[] = L"pulse,alsa,oss,coreaudio";
++    static WCHAR default_list[] = L"aaudio,pulse,alsa,oss,coreaudio";
+     DriverFuncs driver;
+     HKEY key;
+     WCHAR reg_list[256], *p, *next, *driver_list = default_list;
+--- /dev/null
++++ b/dlls/wineaaudio.drv/Makefile.in
+@@ -0,0 +1,7 @@
++MODULE    = wineaaudio.drv
++UNIXLIB   = wineaaudio.so
++IMPORTS   = uuid ole32 user32 advapi32
++UNIX_LIBS = -laaudio $(PTHREAD_LIBS)
++
++SOURCES = \
++	aaudio.c
+--- /dev/null
++++ b/dlls/wineaaudio.drv/aaudio.c
+@@ -0,0 +1,1583 @@
++/*
++ * AAudio driver (unixlib), for Android
++ *
++ * Based on the OSS driver:
++ * Copyright 2011 Andrew Eikum for CodeWeavers
++ *           2022 Huw Davies
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include <stdarg.h>
++#include <stdlib.h>
++#include <string.h>
++#include <pthread.h>
++#include <aaudio/AAudio.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "winternl.h"
++#include "initguid.h"
++#include "audioclient.h"
++#include "mmddk.h"
++
++#include "wine/debug.h"
++#include "wine/unixlib.h"
++
++#include "../mmdevapi/unixlib.h"
++
++/* Render only: the streams keep the OSS driver's local ring buffer, which the
++ * timer loop feeds to an AAudio stream in blocking-write mode, without blocking. */
++struct aaudio_stream
++{
++    WAVEFORMATEX *fmt;
++    EDataFlow flow;
++    UINT flags;
++    AUDCLNT_SHAREMODE share;
++    HANDLE event;
++
++    AAudioStream *aa;
++    aaudio_format_t aa_format;
++
++    BOOL playing, mute, please_quit;
++    UINT64 written_frames, last_pos_frames;
++    UINT32 period_frames, bufsize_frames, held_frames, tmp_buffer_frames, in_dev_frames;
++    UINT32 lcl_offs_frames; /* offs into local_buffer where valid data starts */
++    REFERENCE_TIME period;
++
++    BYTE *local_buffer, *tmp_buffer;
++    INT32 getbuf_last; /* <0 when using tmp_buffer */
++
++    pthread_mutex_t lock;
++};
++
++WINE_DEFAULT_DEBUG_CHANNEL(aaudio);
++
++static const REFERENCE_TIME def_period = 100000;
++static const REFERENCE_TIME min_period = 50000;
++
++static const char default_device[] = "default";
++
++static ULONG_PTR zero_bits = 0;
++
++static NTSTATUS aaudio_not_implemented(void *args)
++{
++    return STATUS_SUCCESS;
++}
++
++/* copied from kernelbase */
++static int muldiv( int a, int b, int c )
++{
++    LONGLONG ret;
++
++    if (!c) return -1;
++
++    /* We want to deal with a positive divisor to simplify the logic. */
++    if (c < 0)
++    {
++        a = -a;
++        c = -c;
++    }
++
++    /* If the result is positive, we "add" to round. else, we subtract to round. */
++    if ((a < 0 && b < 0) || (a >= 0 && b >= 0))
++        ret = (((LONGLONG)a * b) + (c / 2)) / c;
++    else
++        ret = (((LONGLONG)a * b) - (c / 2)) / c;
++
++    if (ret > 2147483647 || ret < -2147483647) return -1;
++    return ret;
++}
++
++static void aaudio_lock(struct aaudio_stream *stream)
++{
++    pthread_mutex_lock(&stream->lock);
++}
++
++static void aaudio_unlock(struct aaudio_stream *stream)
++{
++    pthread_mutex_unlock(&stream->lock);
++}
++
++static NTSTATUS aaudio_unlock_result(struct aaudio_stream *stream,
++                                     HRESULT *result, HRESULT value)
++{
++    *result = value;
++    aaudio_unlock(stream);
++    return STATUS_SUCCESS;
++}
++
++static struct aaudio_stream *handle_get_stream(stream_handle h)
++{
++    return (struct aaudio_stream *)(UINT_PTR)h;
++}
++
++static NTSTATUS aaudio_test_connect(void *args)
++{
++    struct test_connect_params *params = args;
++    AAudioStreamBuilder *builder;
++
++    if (AAudio_createStreamBuilder(&builder) != AAUDIO_OK)
++    {
++        params->priority = Priority_Unavailable;
++        return STATUS_SUCCESS;
++    }
++    AAudioStreamBuilder_delete(builder);
++    params->priority = Priority_Preferred;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_process_attach(void *args)
++{
++#ifdef _WIN64
++    if (NtCurrentTeb()->WowTebOffset)
++    {
++        SYSTEM_BASIC_INFORMATION info;
++
++        NtQuerySystemInformation(SystemEmulationBasicInformation, &info, sizeof(info), NULL);
++        zero_bits = (ULONG_PTR)info.HighestUserAddress | 0x7fffffff;
++    }
++#endif
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_main_loop(void *args)
++{
++    struct main_loop_params *params = args;
++    NtSetEvent(params->event, NULL);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_get_endpoint_ids(void *args)
++{
++    static const WCHAR nameW[] = {'A','n','d','r','o','i','d',' ','a','u','d','i','o',0};
++    struct get_endpoint_ids_params *params = args;
++    unsigned int needed, name_size = sizeof(nameW), device_size = (sizeof(default_device) + 1) & ~1;
++    struct endpoint *endpoint = params->endpoints;
++
++    params->default_idx = 0;
++    if (params->flow != eRender)  /* no capture yet */
++    {
++        params->num = 0;
++        params->result = S_OK;
++        return STATUS_SUCCESS;
++    }
++
++    params->num = 1;
++    needed = sizeof(*endpoint) + name_size + device_size;
++    if (needed > params->size)
++    {
++        params->size = needed;
++        params->result = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
++        return STATUS_SUCCESS;
++    }
++    endpoint->name = sizeof(*endpoint);
++    memcpy((char *)params->endpoints + endpoint->name, nameW, name_size);
++    endpoint->device = endpoint->name + name_size;
++    memcpy((char *)params->endpoints + endpoint->device, default_device, sizeof(default_device));
++    params->result = S_OK;
++    return STATUS_SUCCESS;
++}
++
++static UINT get_channel_mask(unsigned int channels)
++{
++    switch(channels){
++    case 0:
++        return 0;
++    case 1:
++        return KSAUDIO_SPEAKER_MONO;
++    case 2:
++        return KSAUDIO_SPEAKER_STEREO;
++    case 3:
++        return KSAUDIO_SPEAKER_STEREO | SPEAKER_LOW_FREQUENCY;
++    case 4:
++        return KSAUDIO_SPEAKER_QUAD;    /* not _SURROUND */
++    case 5:
++        return KSAUDIO_SPEAKER_QUAD | SPEAKER_LOW_FREQUENCY;
++    case 6:
++        return KSAUDIO_SPEAKER_5POINT1; /* not 5POINT1_SURROUND */
++    case 7:
++        return KSAUDIO_SPEAKER_5POINT1 | SPEAKER_BACK_CENTER;
++    case 8:
++        return KSAUDIO_SPEAKER_7POINT1_SURROUND; /* Vista deprecates 7POINT1 */
++    }
++    FIXME("Unknown speaker configuration: %u\n", channels);
++    return 0;
++}
++
++static aaudio_format_t get_aaudio_format(const WAVEFORMATEX *fmt)
++{
++    const WAVEFORMATEXTENSIBLE *fmtex = (const WAVEFORMATEXTENSIBLE *)fmt;
++
++    if(fmt->wFormatTag == WAVE_FORMAT_PCM ||
++            (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
++             IsEqualGUID(&fmtex->SubFormat, &KSDATAFORMAT_SUBTYPE_PCM))){
++        switch(fmt->wBitsPerSample){
++        case 16:
++            return AAUDIO_FORMAT_PCM_I16;
++        case 24:
++            return AAUDIO_FORMAT_PCM_I24_PACKED;
++        case 32:
++            return AAUDIO_FORMAT_PCM_I32;
++        }
++        return AAUDIO_FORMAT_INVALID;
++    }
++
++    if(fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
++            (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
++             IsEqualGUID(&fmtex->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)))
++        return fmt->wBitsPerSample == 32 ? AAUDIO_FORMAT_PCM_FLOAT : AAUDIO_FORMAT_INVALID;
++
++    return AAUDIO_FORMAT_INVALID;
++}
++
++static WAVEFORMATEXTENSIBLE *clone_format(const WAVEFORMATEX *fmt)
++{
++    WAVEFORMATEXTENSIBLE *ret;
++    size_t size;
++
++    if(fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
++        size = sizeof(WAVEFORMATEXTENSIBLE);
++    else
++        size = sizeof(WAVEFORMATEX);
++
++    ret = malloc(size);
++    if(!ret)
++        return NULL;
++
++    memcpy(ret, fmt, size);
++
++    ret->Format.cbSize = size - sizeof(WAVEFORMATEX);
++
++    return ret;
++}
++
++/* AAudio converts sample rates and channel counts itself, so only the sample
++ * format limits what is supported */
++static HRESULT check_format(AUDCLNT_SHAREMODE share, const WAVEFORMATEX *fmt)
++{
++    const WAVEFORMATEXTENSIBLE *fmtex = (const WAVEFORMATEXTENSIBLE *)fmt;
++    HRESULT ret = S_OK;
++
++    if(get_aaudio_format(fmt) == AAUDIO_FORMAT_INVALID)
++        return AUDCLNT_E_UNSUPPORTED_FORMAT;
++
++    if(fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
++            (fmtex->Format.nAvgBytesPerSec == 0 ||
++             fmtex->Format.nBlockAlign == 0 ||
++             fmtex->Samples.wValidBitsPerSample > fmtex->Format.wBitsPerSample))
++        return E_INVALIDARG;
++
++    if(fmt->nChannels == 0 || fmt->nChannels > 8 || !fmt->nSamplesPerSec)
++        return AUDCLNT_E_UNSUPPORTED_FORMAT;
++
++    if(fmt->nBlockAlign != fmt->nChannels * fmt->wBitsPerSample / 8 ||
++            fmt->nAvgBytesPerSec != fmt->nBlockAlign * fmt->nSamplesPerSec ||
++            (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
++             fmtex->Samples.wValidBitsPerSample < fmtex->Format.wBitsPerSample))
++        ret = S_FALSE;
++
++    if(share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
++            fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE){
++        if(fmtex->dwChannelMask == 0 || fmtex->dwChannelMask & SPEAKER_RESERVED)
++            ret = S_FALSE;
++    }
++
++    TRACE("returning: %08x\n", (unsigned)ret);
++    return ret;
++}
++
++static AAudioStream *open_aaudio_stream(const WAVEFORMATEX *fmt, aaudio_format_t format, UINT32 period_frames)
++{
++    AAudioStreamBuilder *builder;
++    AAudioStream *aa = NULL;
++    aaudio_result_t res;
++    int32_t burst, capacity;
++
++    if ((res = AAudio_createStreamBuilder(&builder)) != AAUDIO_OK)
++    {
++        ERR("AAudio_createStreamBuilder failed: %s\n", AAudio_convertResultToText(res));
++        return NULL;
++    }
++    AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
++    AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
++    AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
++    AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_GAME);
++    AAudioStreamBuilder_setContentType(builder, AAUDIO_CONTENT_TYPE_MUSIC);
++    AAudioStreamBuilder_setSampleRate(builder, fmt->nSamplesPerSec);
++    AAudioStreamBuilder_setChannelCount(builder, fmt->nChannels);
++    AAudioStreamBuilder_setFormat(builder, format);
++    res = AAudioStreamBuilder_openStream(builder, &aa);
++    AAudioStreamBuilder_delete(builder);
++    if (res != AAUDIO_OK)
++    {
++        ERR("AAudioStreamBuilder_openStream failed: %s\n", AAudio_convertResultToText(res));
++        return NULL;
++    }
++
++    /* room for the three periods the timer loop keeps queued */
++    burst = AAudioStream_getFramesPerBurst(aa);
++    capacity = AAudioStream_getBufferCapacityInFrames(aa);
++    AAudioStream_setBufferSizeInFrames(aa, min(capacity, max(burst * 2, (int32_t)period_frames * 3)));
++
++    TRACE("opened %p rate %d channels %d format %d burst %d capacity %d buffer %d\n", aa,
++          AAudioStream_getSampleRate(aa), AAudioStream_getChannelCount(aa), AAudioStream_getFormat(aa),
++          burst, capacity, AAudioStream_getBufferSizeInFrames(aa));
++    return aa;
++}
++
++static NTSTATUS aaudio_create_stream(void *args)
++{
++    struct create_stream_params *params = args;
++    WAVEFORMATEXTENSIBLE *fmtex;
++    struct aaudio_stream *stream;
++    SIZE_T size;
++
++    params->result = S_OK;
++
++    if (params->flow != eRender || strcmp(params->device, default_device))
++    {
++        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++        return STATUS_SUCCESS;
++    }
++
++    stream = calloc(1, sizeof(*stream));
++    if(!stream){
++        params->result = E_OUTOFMEMORY;
++        return STATUS_SUCCESS;
++    }
++
++    stream->flow = params->flow;
++    pthread_mutex_init(&stream->lock, NULL);
++
++    params->result = check_format(params->share, params->fmt);
++    if(FAILED(params->result))
++        goto exit;
++
++    fmtex = clone_format(params->fmt);
++    if(!fmtex){
++        params->result = E_OUTOFMEMORY;
++        goto exit;
++    }
++    stream->fmt = &fmtex->Format;
++    stream->aa_format = get_aaudio_format(stream->fmt);
++
++    stream->period = params->period;
++    stream->period_frames = muldiv(params->fmt->nSamplesPerSec, params->period, 10000000);
++
++    if(!(stream->aa = open_aaudio_stream(stream->fmt, stream->aa_format, stream->period_frames))){
++        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++        goto exit;
++    }
++
++    stream->bufsize_frames = muldiv(params->duration, params->fmt->nSamplesPerSec, 10000000);
++    if(params->share == AUDCLNT_SHAREMODE_EXCLUSIVE)
++        stream->bufsize_frames -= stream->bufsize_frames % stream->period_frames;
++    size = stream->bufsize_frames * params->fmt->nBlockAlign;
++    if(NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer, zero_bits,
++                               &size, MEM_COMMIT, PAGE_READWRITE)){
++        params->result = E_OUTOFMEMORY;
++        goto exit;
++    }
++
++    stream->share = params->share;
++    stream->flags = params->flags;
++
++exit:
++    if(FAILED(params->result)){
++        if(stream->aa) AAudioStream_close(stream->aa);
++        if(stream->local_buffer){
++            size = 0;
++            NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer, &size, MEM_RELEASE);
++        }
++        pthread_mutex_destroy(&stream->lock);
++        free(stream->fmt);
++        free(stream);
++    }else{
++        *params->channel_count = params->fmt->nChannels;
++        *params->stream = (stream_handle)(UINT_PTR)stream;
++    }
++
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_release_stream(void *args)
++{
++    struct release_stream_params *params = args;
++    struct aaudio_stream *stream = handle_get_stream(params->stream);
++    SIZE_T size;
++
++    if(params->timer_thread){
++        stream->please_quit = TRUE;
++        NtWaitForSingleObject(params->timer_thread, FALSE, NULL);
++        NtClose(params->timer_thread);
++    }
++
++    if(stream->aa) AAudioStream_close(stream->aa);
++    if(stream->local_buffer){
++        size = 0;
++        NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer, &size, MEM_RELEASE);
++    }
++    if(stream->tmp_buffer){
++        size = 0;
++        NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer, &size, MEM_RELEASE);
++    }
++    free(stream->fmt);
++    pthread_mutex_destroy(&stream->lock);
++    free(stream);
++
++    params->result = S_OK;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_start(void *args)
++{
++    struct start_params *params = args;
++    struct aaudio_stream *stream = handle_get_stream(params->stream);
++    aaudio_result_t res;
++
++    aaudio_lock(stream);
++
++    if((stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) && !stream->event)
++        return aaudio_unlock_result(stream, &params->result, AUDCLNT_E_EVENTHANDLE_NOT_SET);
++
++    if(stream->playing)
++        return aaudio_unlock_result(stream, &params->result, AUDCLNT_E_NOT_STOPPED);
++
++    if(stream->aa && (res = AAudioStream_requestStart(stream->aa)) != AAUDIO_OK)
++        WARN("requestStart failed: %s\n", AAudio_convertResultToText(res));
++
++    stream->playing = TRUE;
++
++    return aaudio_unlock_result(stream, &params->result, S_OK);
++}
++
++static NTSTATUS aaudio_stop(void *args)
++{
++    struct stop_params *params = args;
++    struct aaudio_stream *stream = handle_get_stream(params->stream);
++
++    aaudio_lock(stream);
++
++    if(!stream->playing)
++        return aaudio_unlock_result(stream, &params->result, S_FALSE);
++
++    /* pause, so that what is queued plays when started again */
++    if(stream->aa) AAudioStream_requestPause(stream->aa);
++    stream->playing = FALSE;
++
++    return aaudio_unlock_result(stream, &params->result, S_OK);
++}
++
++static NTSTATUS aaudio_reset(void *args)
++{
++    struct reset_params *params = args;
++    struct aaudio_stream *stream = handle_get_stream(params->stream);
++
++    aaudio_lock(stream);
++
++    if(stream->playing)
++        return aaudio_unlock_result(stream, &params->result, AUDCLNT_E_NOT_STOPPED);
++
++    if(stream->getbuf_last)
++        return aaudio_unlock_result(stream, &params->result, AUDCLNT_E_BUFFER_OPERATION_PENDING);
++
++    if(stream->aa) AAudioStream_requestFlush(stream->aa);
++
++    stream->written_frames = 0;
++    stream->last_pos_frames = 0;
++    stream->held_frames = 0;
++    stream->lcl_offs_frames = 0;
++    stream->in_dev_frames = 0;
++
++    return aaudio_unlock_result(stream, &params->result, S_OK);
++}
++
++static void silence_buffer(struct aaudio_stream *stream, BYTE *buffer, UINT32 frames)
++{
++    memset(buffer, 0, frames * stream->fmt->nBlockAlign);
++}
++
++/* frames written to AAudio that it hasn't played yet */
++static UINT32 get_queued_frames(struct aaudio_stream *stream)
++{
++    int64_t written = AAudioStream_getFramesWritten(stream->aa);
++    int64_t read = AAudioStream_getFramesRead(stream->aa);
++
++    return written > read ? written - read : 0;
++}
++
++/* the output changed (headphones plugged in, Bluetooth): open a new stream */
++static void reopen_stream(struct aaudio_stream *stream)
++{
++    AAudioStream *aa;
++
++    WARN("output disconnected, reopening\n");
++    if(!(aa = open_aaudio_stream(stream->fmt, stream->aa_format, stream->period_frames))) return;
++    AAudioStream_close(stream->aa);
++    stream->aa = aa;
++    stream->in_dev_frames = 0;
++    if(stream->playing) AAudioStream_requestStart(stream->aa);
++}
++
++static UINT32 write_frames(struct aaudio_stream *stream, BYTE *buf, UINT32 frames)
++{
++    aaudio_result_t res;
++
++    if(stream->mute)
++        silence_buffer(stream, buf, frames);
++
++    res = AAudioStream_write(stream->aa, buf, frames, 0);
++    if(res == AAUDIO_ERROR_DISCONNECTED){
++        reopen_stream(stream);
++        res = AAudioStream_write(stream->aa, buf, frames, 0);
++    }
++    if(res < 0){
++        WARN("write failed: %s\n", AAudio_convertResultToText(res));
++        return 0;
++    }
++    return res;
++}
++
++static void aaudio_write_data(struct aaudio_stream *stream)
++{
++    UINT32 written_frames, in_dev_frames, write_limit, max_period, write_offs_frames, new_frames;
++    SIZE_T to_write_frames, advanced;
++
++    max_period = max((UINT32)AAudioStream_getFramesPerBurst(stream->aa), stream->period_frames);
++
++    in_dev_frames = get_queued_frames(stream);
++    TRACE("state %d written %lld read %lld queued %u held %u in_dev %u\n", AAudioStream_getState(stream->aa),
++          (long long)AAudioStream_getFramesWritten(stream->aa), (long long)AAudioStream_getFramesRead(stream->aa),
++          in_dev_frames, stream->held_frames, stream->in_dev_frames);
++    if(in_dev_frames > stream->in_dev_frames)
++        in_dev_frames = stream->in_dev_frames;
++
++    write_limit = 0;
++    while(write_limit + in_dev_frames < max_period * 3)
++        write_limit += max_period;
++    if(write_limit == 0)
++        return;
++
++    /*        vvvvvv - in_dev_frames
++     * [--xxxxxxxxxx]
++     *       [xxxxxxxxxx--]
++     *        ^^^^^^^^^^ - held_frames
++     *        ^ - lcl_offs_frames
++     */
++    advanced = stream->in_dev_frames - in_dev_frames;
++    if(advanced > stream->held_frames)
++        advanced = stream->held_frames;
++    stream->lcl_offs_frames += advanced;
++    stream->lcl_offs_frames %= stream->bufsize_frames;
++    stream->held_frames -= advanced;
++    stream->in_dev_frames = in_dev_frames;
++
++    if(stream->held_frames == stream->in_dev_frames)
++        return;
++
++    write_offs_frames = (stream->lcl_offs_frames + stream->in_dev_frames) % stream->bufsize_frames;
++    new_frames = stream->held_frames - stream->in_dev_frames;
++
++    if(write_offs_frames + new_frames > stream->bufsize_frames)
++        to_write_frames = stream->bufsize_frames - write_offs_frames;
++    else
++        to_write_frames = new_frames;
++    to_write_frames = min(to_write_frames, write_limit);
++
++    written_frames = write_frames(stream, stream->local_buffer + write_offs_frames * stream->fmt->nBlockAlign,
++                                  to_write_frames);
++    stream->in_dev_frames += written_frames;
++    if(written_frames < to_write_frames)
++        return;  /* AAudio buffer full */
++
++    if(new_frames > written_frames && written_frames < write_limit){
++        /* wrapped and have some data back at the start to write */
++        to_write_frames = min(write_limit - written_frames, new_frames - written_frames);
++        stream->in_dev_frames += write_frames(stream, stream->local_buffer, to_write_frames);
++    }
++}
++
++static NTSTATUS aaudio_timer_loop(void *args)
++{
++    struct timer_loop_params *params = args;
++    struct aaudio_stream *stream = handle_get_stream(params->stream);
++    LARGE_INTEGER delay, now, next;
++    int adjust;
++
++    aaudio_lock(stream);
++
++    delay.QuadPart = -stream->period;
++    NtQueryPerformanceCounter(&now, NULL);
++    next.QuadPart = now.QuadPart + stream->period;
++
++    while(!stream->please_quit){
++        if(stream->playing && stream->held_frames)
++            aaudio_write_data(stream);
++        if(stream->event)
++            NtSetEvent(stream->event, NULL);
++        aaudio_unlock(stream);
++
++        NtDelayExecution(FALSE, &delay);
++
++        aaudio_lock(stream);
++        NtQueryPerformanceCounter(&now, NULL);
++        adjust = next.QuadPart - now.QuadPart;
++        if(adjust > stream->period / 2)
++            adjust = stream->period / 2;
++        else if(adjust < -stream->period / 2)
++            adjust = -stream->period / 2;
++        delay.QuadPart = -(stream->period + adjust);
++        next.QuadPart += stream->period;
++    }
++
++    aaudio_unlock(stream);
++
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_get_render_buffer(void *args)
++{
++    struct get_render_buffer_params *params = args;
++    struct aaudio_stream *stream = handle_get_stream(params->stream);
++    UINT32 write_pos, frames = params->frames;
++    BYTE **data = params->data;
++    SIZE_T size;
++
++    aaudio_lock(stream);
++
++    if(stream->getbuf_last)
++        return aaudio_unlock_result(stream, &params->result, AUDCLNT_E_OUT_OF_ORDER);
++
++    if(!frames)
++        return aaudio_unlock_result(stream, &params->result, S_OK);
++
++    if(stream->held_frames + frames > stream->bufsize_frames)
++        return aaudio_unlock_result(stream, &params->result, AUDCLNT_E_BUFFER_TOO_LARGE);
++
++    write_pos =
++        (stream->lcl_offs_frames + stream->held_frames) % stream->bufsize_frames;
++    if(write_pos + frames > stream->bufsize_frames){
++        if(stream->tmp_buffer_frames < frames){
++            if(stream->tmp_buffer){
++                size = 0;
++                NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer, &size, MEM_RELEASE);
++                stream->tmp_buffer = NULL;
++            }
++            size = frames * stream->fmt->nBlockAlign;
++            if(NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer, zero_bits,
++                                       &size, MEM_COMMIT, PAGE_READWRITE)){
++                stream->tmp_buffer_frames = 0;
++                return aaudio_unlock_result(stream, &params->result, E_OUTOFMEMORY);
++            }
++            stream->tmp_buffer_frames = frames;
++        }
++        *data = stream->tmp_buffer;
++        stream->getbuf_last = -frames;
++    }else{
++        *data = stream->local_buffer + write_pos * stream->fmt->nBlockAlign;
++        stream->getbuf_last = frames;
++    }
++
++    silence_buffer(stream, *data, frames);
++
++    return aaudio_unlock_result(stream, &params->result, S_OK);
++}
++
++static void aaudio_wrap_buffer(struct aaudio_stream *stream, BYTE *buffer, UINT32 written_frames)
++{
++    UINT32 write_offs_frames =
++        (stream->lcl_offs_frames + stream->held_frames) % stream->bufsize_frames;
++    UINT32 write_offs_bytes = write_offs_frames * stream->fmt->nBlockAlign;
++    UINT32 chunk_frames = stream->bufsize_frames - write_offs_frames;
++    UINT32 chunk_bytes = chunk_frames * stream->fmt->nBlockAlign;
++    UINT32 written_bytes = written_frames * stream->fmt->nBlockAlign;
++
++    if(written_bytes <= chunk_bytes){
++        memcpy(stream->local_buffer + write_offs_bytes, buffer, written_bytes);
++    }else{
++        memcpy(stream->local_buffer + write_offs_bytes, buffer, chunk_bytes);
++        memcpy(stream->local_buffer, buffer + chunk_bytes,
++                written_bytes - chunk_bytes);
++    }
++}
++
++static NTSTATUS aaudio_release_render_buffer(void *args)
++{
++    struct release_render_buffer_params *params = args;
++    struct aaudio_stream *stream = handle_get_stream(params->stream);
++    UINT32 written_frames = params->written_frames;
++    UINT flags = params->flags;
++    BYTE *buffer;
++
++    aaudio_lock(stream);
++
++    if(!written_frames){
++        stream->getbuf_last = 0;
++        return aaudio_unlock_result(stream, &params->result, S_OK);
++    }
++
++    if(!stream->getbuf_last)
++        return aaudio_unlock_result(stream, &params->result, AUDCLNT_E_OUT_OF_ORDER);
++
++    if(written_frames > (stream->getbuf_last >= 0 ? stream->getbuf_last : -stream->getbuf_last))
++        return aaudio_unlock_result(stream, &params->result, AUDCLNT_E_INVALID_SIZE);
++
++    if(stream->getbuf_last >= 0)
++        buffer = stream->local_buffer + stream->fmt->nBlockAlign *
++          ((stream->lcl_offs_frames + stream->held_frames) % stream->bufsize_frames);
++    else
++        buffer = stream->tmp_buffer;
++
++    if(flags & AUDCLNT_BUFFERFLAGS_SILENT)
++        silence_buffer(stream, buffer, written_frames);
++
++    if(stream->getbuf_last < 0)
++        aaudio_wrap_buffer(stream, buffer, written_frames);
++
++    stream->held_frames += written_frames;
++    stream->written_frames += written_frames;
++    stream->getbuf_last = 0;
++
++    return aaudio_unlock_result(stream, &params->result, S_OK);
++}
++
++static NTSTATUS aaudio_get_capture_buffer(void *args)
++{
++    struct get_capture_buffer_params *params = args;
++
++    params->result = AUDCLNT_E_WRONG_ENDPOINT_TYPE;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_release_capture_buffer(void *args)
++{
++    struct release_capture_buffer_params *params = args;
++
++    params->result = AUDCLNT_E_WRONG_ENDPOINT_TYPE;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_is_format_supported(void *args)
++{
++    struct is_format_supported_params *params = args;
++
++    if(params->flow != eRender || strcmp(params->device, default_device)){
++        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++        return STATUS_SUCCESS;
++    }
++    params->result = check_format(params->share, params->fmt_in);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_get_mix_format(void *args)
++{
++    struct get_mix_format_params *params = args;
++    WAVEFORMATEXTENSIBLE *fmt = params->fmt;
++
++    if(params->flow != eRender){
++        params->result = params->flow == eCapture ? AUDCLNT_E_DEVICE_INVALIDATED : E_UNEXPECTED;
++        return STATUS_SUCCESS;
++    }
++
++    /* what Android's mixer uses */
++    fmt->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
++    fmt->Format.wBitsPerSample = 32;
++    fmt->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
++    fmt->Format.nChannels = 2;
++    fmt->Format.nSamplesPerSec = 48000;
++    fmt->dwChannelMask = get_channel_mask(fmt->Format.nChannels);
++    fmt->Format.nBlockAlign = (fmt->Format.wBitsPerSample * fmt->Format.nChannels) / 8;
++    fmt->Format.nAvgBytesPerSec = fmt->Format.nSamplesPerSec * fmt->Format.nBlockAlign;
++    fmt->Samples.wValidBitsPerSample = fmt->Format.wBitsPerSample;
++    fmt->Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
++
++    params->result = S_OK;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_get_device_period(void *args)
++{
++    struct get_device_period_params *params = args;
++
++    if (params->def_period)
++        *params->def_period = def_period;
++    if (params->min_period)
++        *params->min_period = min_period;
++
++    params->result = S_OK;
++
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_get_buffer_size(void *args)
++{
++    struct get_buffer_size_params *params = args;
++    struct aaudio_stream *stream = handle_get_stream(params->stream);
++
++    aaudio_lock(stream);
++
++    *params->frames = stream->bufsize_frames;
++
++    return aaudio_unlock_result(stream, &params->result, S_OK);
++}
++
++static NTSTATUS aaudio_get_latency(void *args)
++{
++    struct get_latency_params *params = args;
++    struct aaudio_stream *stream = handle_get_stream(params->stream);
++
++    aaudio_lock(stream);
++
++    /* pretend we process audio in Period chunks, so max latency includes
++     * the period time.  Some native machines add .6666ms in shared mode. */
++    *params->latency = stream->period + 6666;
++
++    return aaudio_unlock_result(stream, &params->result, S_OK);
++}
++
++static NTSTATUS aaudio_get_current_padding(void *args)
++{
++    struct get_current_padding_params *params = args;
++    struct aaudio_stream *stream = handle_get_stream(params->stream);
++
++    aaudio_lock(stream);
++
++    *params->padding = stream->held_frames;
++
++    return aaudio_unlock_result(stream, &params->result, S_OK);
++}
++
++static NTSTATUS aaudio_get_next_packet_size(void *args)
++{
++    struct get_next_packet_size_params *params = args;
++    struct aaudio_stream *stream = handle_get_stream(params->stream);
++    UINT32 *frames = params->frames;
++
++    aaudio_lock(stream);
++
++    *frames = stream->held_frames < stream->period_frames ? 0 : stream->period_frames;
++
++    return aaudio_unlock_result(stream, &params->result, S_OK);
++}
++
++static NTSTATUS aaudio_get_frequency(void *args)
++{
++    struct get_frequency_params *params = args;
++    struct aaudio_stream *stream = handle_get_stream(params->stream);
++    UINT64 *freq = params->freq;
++
++    aaudio_lock(stream);
++
++    if(stream->share == AUDCLNT_SHAREMODE_SHARED)
++        *freq = (UINT64)stream->fmt->nSamplesPerSec * stream->fmt->nBlockAlign;
++    else
++        *freq = stream->fmt->nSamplesPerSec;
++
++    return aaudio_unlock_result(stream, &params->result, S_OK);
++}
++
++static NTSTATUS aaudio_get_position(void *args)
++{
++    struct get_position_params *params = args;
++    struct aaudio_stream *stream = handle_get_stream(params->stream);
++    UINT64 *pos = params->pos, *qpctime = params->qpctime;
++
++    if (params->device) {
++        FIXME("Device position reporting not implemented\n");
++        params->result = E_NOTIMPL;
++        return STATUS_SUCCESS;
++    }
++
++    aaudio_lock(stream);
++
++    *pos = stream->written_frames - stream->held_frames;
++    if(*pos < stream->last_pos_frames)
++        *pos = stream->last_pos_frames;
++    stream->last_pos_frames = *pos;
++
++    TRACE("returning: %s\n", wine_dbgstr_longlong(*pos));
++    if(stream->share == AUDCLNT_SHAREMODE_SHARED)
++        *pos *= stream->fmt->nBlockAlign;
++
++    if(qpctime){
++        LARGE_INTEGER stamp, freq;
++        NtQueryPerformanceCounter(&stamp, &freq);
++        *qpctime = (stamp.QuadPart * (INT64)10000000) / freq.QuadPart;
++    }
++
++    return aaudio_unlock_result(stream, &params->result, S_OK);
++}
++
++static NTSTATUS aaudio_set_volumes(void *args)
++{
++    struct set_volumes_params *params = args;
++    struct aaudio_stream *stream = handle_get_stream(params->stream);
++    UINT16 i;
++
++    if (params->master_volume) {
++        for (i = 0; i < stream->fmt->nChannels; ++i) {
++            if (params->master_volume * params->volumes[i] * params->session_volumes[i] != 1.0f) {
++                FIXME("Volume control is not implemented\n");
++                break;
++            }
++        }
++    }
++
++    aaudio_lock(stream);
++    stream->mute = !params->master_volume;
++    aaudio_unlock(stream);
++
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_set_event_handle(void *args)
++{
++    struct set_event_handle_params *params = args;
++    struct aaudio_stream *stream = handle_get_stream(params->stream);
++
++    aaudio_lock(stream);
++
++    if(!(stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
++        return aaudio_unlock_result(stream, &params->result, AUDCLNT_E_EVENTHANDLE_NOT_EXPECTED);
++
++    if (stream->event){
++        FIXME("called twice\n");
++        return aaudio_unlock_result(stream, &params->result, HRESULT_FROM_WIN32(ERROR_INVALID_NAME));
++    }
++
++    stream->event = params->event;
++
++    return aaudio_unlock_result(stream, &params->result, S_OK);
++}
++
++static NTSTATUS aaudio_is_started(void *args)
++{
++    struct is_started_params *params = args;
++    struct aaudio_stream *stream = handle_get_stream(params->stream);
++
++    aaudio_lock(stream);
++
++    return aaudio_unlock_result(stream, &params->result, stream->playing ? S_OK : S_FALSE);
++}
++
++static NTSTATUS aaudio_get_prop_value(void *args)
++{
++    struct get_prop_value_params *params = args;
++
++    params->result = E_NOTIMPL;
++
++    return STATUS_SUCCESS;
++}
++
++/* No MIDI or aux devices: mmdevapi uses the audio driver for MIDI too */
++
++static NTSTATUS aaudio_midi_init(void *args)
++{
++    struct midi_init_params *params = args;
++
++    *params->err = DRV_FAILURE;  /* no MIDI, so no notify thread */
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_midi_release(void *args)
++{
++    struct midi_init_params *params = args;
++
++    *params->err = DRV_SUCCESS;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_midi_message(void *args)
++{
++    struct midi_out_message_params *params = args;
++
++    if (params->notify) params->notify->send_notify = FALSE;
++    switch (params->msg)
++    {
++    case DRVM_INIT:
++    case DRVM_EXIT:
++    case DRVM_ENABLE:
++    case DRVM_DISABLE:
++    case MODM_GETNUMDEVS:  /* == MIDM_GETNUMDEVS */
++        *params->err = 0;
++        break;
++    default:
++        *params->err = MMSYSERR_BADDEVICEID;
++        break;
++    }
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_aux_message(void *args)
++{
++    struct aux_message_params *params = args;
++
++    switch (params->msg)
++    {
++    case DRVM_INIT:
++    case DRVM_EXIT:
++    case DRVM_ENABLE:
++    case DRVM_DISABLE:
++    case AUXDM_GETNUMDEVS:
++        *params->err = 0;
++        break;
++    default:
++        *params->err = MMSYSERR_BADDEVICEID;
++        break;
++    }
++    return STATUS_SUCCESS;
++}
++
++const unixlib_entry_t __wine_unix_call_funcs[] =
++{
++    aaudio_process_attach,
++    aaudio_not_implemented,
++    aaudio_main_loop,
++    aaudio_get_endpoint_ids,
++    aaudio_create_stream,
++    aaudio_release_stream,
++    aaudio_start,
++    aaudio_stop,
++    aaudio_reset,
++    aaudio_timer_loop,
++    aaudio_get_render_buffer,
++    aaudio_release_render_buffer,
++    aaudio_get_capture_buffer,
++    aaudio_release_capture_buffer,
++    aaudio_is_format_supported,
++    aaudio_not_implemented,
++    aaudio_get_mix_format,
++    aaudio_get_device_period,
++    aaudio_get_buffer_size,
++    aaudio_get_latency,
++    aaudio_get_current_padding,
++    aaudio_get_next_packet_size,
++    aaudio_get_frequency,
++    aaudio_get_position,
++    aaudio_set_volumes,
++    aaudio_set_event_handle,
++    aaudio_not_implemented,
++    aaudio_test_connect,
++    aaudio_is_started,
++    aaudio_get_prop_value,
++    aaudio_not_implemented,
++    aaudio_midi_init,
++    aaudio_midi_release,
++    aaudio_midi_message,
++    aaudio_midi_message,
++    aaudio_not_implemented,
++    aaudio_aux_message,
++};
++
++C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
++
++#ifdef _WIN64
++
++typedef UINT PTR32;
++
++static NTSTATUS aaudio_wow64_test_connect(void *args)
++{
++    struct
++    {
++        PTR32 name;
++        enum driver_priority priority;
++    } *params32 = args;
++    struct test_connect_params params =
++    {
++        .name = ULongToPtr(params32->name),
++    };
++    aaudio_test_connect(&params);
++    params32->priority = params.priority;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_wow64_main_loop(void *args)
++{
++    struct
++    {
++        PTR32 event;
++    } *params32 = args;
++    struct main_loop_params params =
++    {
++        .event = ULongToHandle(params32->event)
++    };
++    return aaudio_main_loop(&params);
++}
++
++static NTSTATUS aaudio_wow64_get_endpoint_ids(void *args)
++{
++    struct
++    {
++        EDataFlow flow;
++        PTR32 endpoints;
++        unsigned int size;
++        HRESULT result;
++        unsigned int num;
++        unsigned int default_idx;
++    } *params32 = args;
++    struct get_endpoint_ids_params params =
++    {
++        .flow = params32->flow,
++        .endpoints = ULongToPtr(params32->endpoints),
++        .size = params32->size
++    };
++    aaudio_get_endpoint_ids(&params);
++    params32->size = params.size;
++    params32->result = params.result;
++    params32->num = params.num;
++    params32->default_idx = params.default_idx;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_wow64_create_stream(void *args)
++{
++    struct
++    {
++        PTR32 name;
++        PTR32 device;
++        EDataFlow flow;
++        AUDCLNT_SHAREMODE share;
++        UINT flags;
++        REFERENCE_TIME duration;
++        REFERENCE_TIME period;
++        PTR32 fmt;
++        HRESULT result;
++        PTR32 channel_count;
++        PTR32 stream;
++    } *params32 = args;
++    struct create_stream_params params =
++    {
++        .name = ULongToPtr(params32->name),
++        .device = ULongToPtr(params32->device),
++        .flow = params32->flow,
++        .share = params32->share,
++        .flags = params32->flags,
++        .duration = params32->duration,
++        .period = params32->period,
++        .fmt = ULongToPtr(params32->fmt),
++        .channel_count = ULongToPtr(params32->channel_count),
++        .stream = ULongToPtr(params32->stream)
++    };
++    aaudio_create_stream(&params);
++    params32->result = params.result;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_wow64_release_stream(void *args)
++{
++    struct
++    {
++        stream_handle stream;
++        PTR32 timer_thread;
++        HRESULT result;
++    } *params32 = args;
++    struct release_stream_params params =
++    {
++        .stream = params32->stream,
++        .timer_thread = ULongToHandle(params32->timer_thread)
++    };
++    aaudio_release_stream(&params);
++    params32->result = params.result;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_wow64_get_render_buffer(void *args)
++{
++    struct
++    {
++        stream_handle stream;
++        UINT32 frames;
++        HRESULT result;
++        PTR32 data;
++    } *params32 = args;
++    BYTE *data = NULL;
++    struct get_render_buffer_params params =
++    {
++        .stream = params32->stream,
++        .frames = params32->frames,
++        .data = &data
++    };
++    aaudio_get_render_buffer(&params);
++    params32->result = params.result;
++    *(unsigned int *)ULongToPtr(params32->data) = PtrToUlong(data);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_wow64_get_capture_buffer(void *args)
++{
++    struct
++    {
++        stream_handle stream;
++        HRESULT result;
++    } *params32 = args;
++
++    params32->result = AUDCLNT_E_WRONG_ENDPOINT_TYPE;
++    return STATUS_SUCCESS;
++};
++
++static NTSTATUS aaudio_wow64_is_format_supported(void *args)
++{
++    struct
++    {
++        PTR32 device;
++        EDataFlow flow;
++        AUDCLNT_SHAREMODE share;
++        PTR32 fmt_in;
++        HRESULT result;
++    } *params32 = args;
++    struct is_format_supported_params params =
++    {
++        .device = ULongToPtr(params32->device),
++        .flow = params32->flow,
++        .share = params32->share,
++        .fmt_in = ULongToPtr(params32->fmt_in),
++    };
++    aaudio_is_format_supported(&params);
++    params32->result = params.result;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_wow64_get_mix_format(void *args)
++{
++    struct
++    {
++        PTR32 device;
++        EDataFlow flow;
++        PTR32 fmt;
++        HRESULT result;
++    } *params32 = args;
++    struct get_mix_format_params params =
++    {
++        .device = ULongToPtr(params32->device),
++        .flow = params32->flow,
++        .fmt = ULongToPtr(params32->fmt)
++    };
++    aaudio_get_mix_format(&params);
++    params32->result = params.result;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_wow64_get_device_period(void *args)
++{
++    struct
++    {
++        PTR32 device;
++        EDataFlow flow;
++        HRESULT result;
++        PTR32 def_period;
++        PTR32 min_period;
++    } *params32 = args;
++    struct get_device_period_params params =
++    {
++        .device = ULongToPtr(params32->device),
++        .flow = params32->flow,
++        .def_period = ULongToPtr(params32->def_period),
++        .min_period = ULongToPtr(params32->min_period),
++    };
++    aaudio_get_device_period(&params);
++    params32->result = params.result;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_wow64_get_buffer_size(void *args)
++{
++    struct
++    {
++        stream_handle stream;
++        HRESULT result;
++        PTR32 frames;
++    } *params32 = args;
++    struct get_buffer_size_params params =
++    {
++        .stream = params32->stream,
++        .frames = ULongToPtr(params32->frames)
++    };
++    aaudio_get_buffer_size(&params);
++    params32->result = params.result;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_wow64_get_latency(void *args)
++{
++    struct
++    {
++        stream_handle stream;
++        HRESULT result;
++        PTR32 latency;
++    } *params32 = args;
++    struct get_latency_params params =
++    {
++        .stream = params32->stream,
++        .latency = ULongToPtr(params32->latency)
++    };
++    aaudio_get_latency(&params);
++    params32->result = params.result;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_wow64_get_current_padding(void *args)
++{
++    struct
++    {
++        stream_handle stream;
++        HRESULT result;
++        PTR32 padding;
++    } *params32 = args;
++    struct get_current_padding_params params =
++    {
++        .stream = params32->stream,
++        .padding = ULongToPtr(params32->padding)
++    };
++    aaudio_get_current_padding(&params);
++    params32->result = params.result;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_wow64_get_next_packet_size(void *args)
++{
++    struct
++    {
++        stream_handle stream;
++        HRESULT result;
++        PTR32 frames;
++    } *params32 = args;
++    struct get_next_packet_size_params params =
++    {
++        .stream = params32->stream,
++        .frames = ULongToPtr(params32->frames)
++    };
++    aaudio_get_next_packet_size(&params);
++    params32->result = params.result;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_wow64_get_frequency(void *args)
++{
++    struct
++    {
++        stream_handle stream;
++        HRESULT result;
++        PTR32 freq;
++    } *params32 = args;
++    struct get_frequency_params params =
++    {
++        .stream = params32->stream,
++        .freq = ULongToPtr(params32->freq)
++    };
++    aaudio_get_frequency(&params);
++    params32->result = params.result;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_wow64_get_position(void *args)
++{
++    struct
++    {
++        stream_handle stream;
++        BOOL device;
++        HRESULT result;
++        PTR32 pos;
++        PTR32 qpctime;
++    } *params32 = args;
++    struct get_position_params params =
++    {
++        .stream = params32->stream,
++        .device = params32->device,
++        .pos = ULongToPtr(params32->pos),
++        .qpctime = ULongToPtr(params32->qpctime)
++    };
++    aaudio_get_position(&params);
++    params32->result = params.result;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_wow64_set_volumes(void *args)
++{
++    struct
++    {
++        stream_handle stream;
++        float master_volume;
++        PTR32 volumes;
++        PTR32 session_volumes;
++    } *params32 = args;
++    struct set_volumes_params params =
++    {
++        .stream = params32->stream,
++        .master_volume = params32->master_volume,
++        .volumes = ULongToPtr(params32->volumes),
++        .session_volumes = ULongToPtr(params32->session_volumes),
++    };
++    return aaudio_set_volumes(&params);
++}
++
++static NTSTATUS aaudio_wow64_set_event_handle(void *args)
++{
++    struct
++    {
++        stream_handle stream;
++        PTR32 event;
++        HRESULT result;
++    } *params32 = args;
++    struct set_event_handle_params params =
++    {
++        .stream = params32->stream,
++        .event = ULongToHandle(params32->event)
++    };
++
++    aaudio_set_event_handle(&params);
++    params32->result = params.result;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_wow64_get_prop_value(void *args)
++{
++    struct
++    {
++        PTR32 device;
++        EDataFlow flow;
++        PTR32 guid;
++        PTR32 prop;
++        HRESULT result;
++    } *params32 = args;
++
++    params32->result = E_NOTIMPL;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_wow64_midi_init(void *args)
++{
++    struct
++    {
++        PTR32 err;
++    } *params32 = args;
++    struct midi_init_params params =
++    {
++        .err = ULongToPtr(params32->err)
++    };
++    return aaudio_midi_init(&params);
++}
++
++static NTSTATUS aaudio_wow64_midi_release(void *args)
++{
++    struct
++    {
++        PTR32 err;
++    } *params32 = args;
++    struct midi_init_params params =
++    {
++        .err = ULongToPtr(params32->err)
++    };
++    return aaudio_midi_release(&params);
++}
++
++static NTSTATUS aaudio_wow64_midi_message(void *args)
++{
++    struct
++    {
++        UINT dev_id;
++        UINT msg;
++        UINT user;
++        UINT param_1;
++        UINT param_2;
++        PTR32 err;
++        PTR32 notify;
++    } *params32 = args;
++    struct notify_context32
++    {
++        BOOL send_notify;
++    } *notify32 = ULongToPtr(params32->notify);
++    struct midi_out_message_params params =
++    {
++        .dev_id = params32->dev_id,
++        .msg = params32->msg,
++        .err = ULongToPtr(params32->err),
++    };
++    aaudio_midi_message(&params);
++    if (notify32) notify32->send_notify = FALSE;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_wow64_aux_message(void *args)
++{
++    struct
++    {
++        UINT dev_id;
++        UINT msg;
++        UINT user;
++        UINT param_1;
++        UINT param_2;
++        PTR32 err;
++    } *params32 = args;
++    struct aux_message_params params =
++    {
++        .dev_id = params32->dev_id,
++        .msg = params32->msg,
++        .user = params32->user,
++        .param_1 = params32->param_1,
++        .param_2 = params32->param_2,
++        .err = ULongToPtr(params32->err),
++    };
++    return aaudio_aux_message(&params);
++}
++
++const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
++{
++    aaudio_process_attach,
++    aaudio_not_implemented,
++    aaudio_wow64_main_loop,
++    aaudio_wow64_get_endpoint_ids,
++    aaudio_wow64_create_stream,
++    aaudio_wow64_release_stream,
++    aaudio_start,
++    aaudio_stop,
++    aaudio_reset,
++    aaudio_timer_loop,
++    aaudio_wow64_get_render_buffer,
++    aaudio_release_render_buffer,
++    aaudio_wow64_get_capture_buffer,
++    aaudio_release_capture_buffer,
++    aaudio_wow64_is_format_supported,
++    aaudio_not_implemented,
++    aaudio_wow64_get_mix_format,
++    aaudio_wow64_get_device_period,
++    aaudio_wow64_get_buffer_size,
++    aaudio_wow64_get_latency,
++    aaudio_wow64_get_current_padding,
++    aaudio_wow64_get_next_packet_size,
++    aaudio_wow64_get_frequency,
++    aaudio_wow64_get_position,
++    aaudio_wow64_set_volumes,
++    aaudio_wow64_set_event_handle,
++    aaudio_not_implemented,
++    aaudio_wow64_test_connect,
++    aaudio_is_started,
++    aaudio_wow64_get_prop_value,
++    aaudio_not_implemented,
++    aaudio_wow64_midi_init,
++    aaudio_wow64_midi_release,
++    aaudio_wow64_midi_message,
++    aaudio_wow64_midi_message,
++    aaudio_not_implemented,
++    aaudio_wow64_aux_message,
++};
++
++C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);
++
++#endif /* _WIN64 */
