@@ -3,12 +3,18 @@ Subject: [PATCH] wineaaudio.drv: Add an AAudio audio driver for Android.
 Wine's Android build had no audio driver since the OpenSL ES one was
 dropped, so every program was silent ("No driver from pulse,alsa,oss,
 coreaudio could be initialized"). Add one based on the OSS driver: its
-ring buffer and timer loop feed an AAudio output stream (shared,
-low-latency, game usage) through non-blocking writes; AAudio converts
-sample rates and channel counts, so only the sample format limits what
-is supported. The stream is reopened when the output disconnects
-(headphones, Bluetooth). Render only, no capture or volume control yet;
-no MIDI or aux devices. mmdevapi tries it first.
+ring buffer and timer loop feed an AAudio output stream through
+non-blocking writes; AAudio converts sample rates and channel counts, so
+only the sample format limits what is supported. The stream is reopened
+when the output disconnects. Render only, no capture or volume control
+yet; no MIDI or aux devices. mmdevapi tries it first.
+
+On Android 17 desktop devices, low-latency or game-usage streams made the
+audio server disable the Bluetooth (A2DP) port or drop the headset, so the
+streams are plain media ones. Android only starts playing a stream once
+its buffer was filled, which the program's data alone may never do
+(Bluetooth buffers hold over 13000 frames), so a started stream is first
+filled with silence, which the padding and position don't count.
 ---
 diff --git a/configure.ac b/configure.ac
 index b8ae3db..f54c2f9 100644
@@ -63,7 +69,7 @@ index 66a6327..ba71244 100644
 +	aaudio.c
 --- /dev/null
 +++ b/dlls/wineaaudio.drv/aaudio.c
-@@ -0,0 +1,1583 @@
+@@ -0,0 +1,1614 @@
 +/*
 + * AAudio driver (unixlib), for Android
 + *
@@ -120,6 +126,7 @@ index 66a6327..ba71244 100644
 +
 +    AAudioStream *aa;
 +    aaudio_format_t aa_format;
++    int64_t silence_end; /* AAudio frame position where the silence written on start ends */
 +
 +    BOOL playing, mute, please_quit;
 +    UINT64 written_frames, last_pos_frames;
@@ -383,8 +390,12 @@ index 66a6327..ba71244 100644
 +    }
 +    AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
 +    AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
-+    AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
-+    AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_GAME);
++    /* not AAUDIO_PERFORMANCE_MODE_LOW_LATENCY: with a low-latency stream playing,
++     * Android's audio server disabled the Bluetooth (A2DP) output port */
++    AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_NONE);
++    /* not AAUDIO_USAGE_GAME: game audio made Android re-evaluate the Bluetooth
++     * headset's profile (LE Audio) on every stream, until the headset dropped */
++    AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_MEDIA);
 +    AAudioStreamBuilder_setContentType(builder, AAUDIO_CONTENT_TYPE_MUSIC);
 +    AAudioStreamBuilder_setSampleRate(builder, fmt->nSamplesPerSec);
 +    AAudioStreamBuilder_setChannelCount(builder, fmt->nChannels);
@@ -512,6 +523,8 @@ index 66a6327..ba71244 100644
 +    return STATUS_SUCCESS;
 +}
 +
++static void write_start_silence(struct aaudio_stream *stream);
++
 +static NTSTATUS aaudio_start(void *args)
 +{
 +    struct start_params *params = args;
@@ -526,6 +539,7 @@ index 66a6327..ba71244 100644
 +    if(stream->playing)
 +        return aaudio_unlock_result(stream, &params->result, AUDCLNT_E_NOT_STOPPED);
 +
++    if(stream->aa) write_start_silence(stream);
 +    if(stream->aa && (res = AAudioStream_requestStart(stream->aa)) != AAUDIO_OK)
 +        WARN("requestStart failed: %s\n", AAudio_convertResultToText(res));
 +
@@ -580,13 +594,32 @@ index 66a6327..ba71244 100644
 +    memset(buffer, 0, frames * stream->fmt->nBlockAlign);
 +}
 +
-+/* frames written to AAudio that it hasn't played yet */
++/* frames of the program's written to AAudio that it hasn't played yet */
 +static UINT32 get_queued_frames(struct aaudio_stream *stream)
 +{
 +    int64_t written = AAudioStream_getFramesWritten(stream->aa);
-+    int64_t read = AAudioStream_getFramesRead(stream->aa);
++    int64_t start = max(AAudioStream_getFramesRead(stream->aa), stream->silence_end);
 +
-+    return written > read ? written - read : 0;
++    return written > start ? written - start : 0;
++}
++
++/* Android starts playing a stream only once its buffer was filled, which the
++ * program's data alone may never do (Bluetooth has buffers of over 13000 frames),
++ * so start with a buffer full of silence */
++static void write_start_silence(struct aaudio_stream *stream)
++{
++    int64_t written = AAudioStream_getFramesWritten(stream->aa);
++    int32_t frames;
++    void *silence;
++    aaudio_result_t res;
++
++    if (written != AAudioStream_getFramesRead(stream->aa)) return;  /* not drained */
++    frames = AAudioStream_getBufferSizeInFrames(stream->aa);
++    if (frames <= 0 || !(silence = calloc(frames, stream->fmt->nBlockAlign))) return;
++    res = AAudioStream_write(stream->aa, silence, frames, 0);
++    free(silence);
++    if (res > 0) stream->silence_end = written + res;
++    TRACE("wrote %d frames of silence\n", res);
 +}
 +
 +/* the output changed (headphones plugged in, Bluetooth): open a new stream */
@@ -599,7 +632,11 @@ index 66a6327..ba71244 100644
 +    AAudioStream_close(stream->aa);
 +    stream->aa = aa;
 +    stream->in_dev_frames = 0;
-+    if(stream->playing) AAudioStream_requestStart(stream->aa);
++    stream->silence_end = 0;
++    if(stream->playing){
++        write_start_silence(stream);
++        AAudioStream_requestStart(stream->aa);
++    }
 +}
 +
 +static UINT32 write_frames(struct aaudio_stream *stream, BYTE *buf, UINT32 frames)

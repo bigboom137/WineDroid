@@ -82,7 +82,9 @@ public class LauncherActivity extends Activity
         if (!hasRuntime( runtime )) runtime = WineActivity.RUNTIME_WINE;
         buildUi();
         requestStorage();
-        handleViewIntent( getIntent() );
+        /* not when Android recreates the launcher after Wine exited: it would run the
+         * program it was opened with again, and again each time it exits */
+        if (savedInstanceState == null) handleViewIntent( getIntent() );
     }
 
     @Override
