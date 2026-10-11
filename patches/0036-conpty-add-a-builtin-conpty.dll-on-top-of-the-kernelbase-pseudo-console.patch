@@ -1,0 +1,109 @@
+From: WineDroid
+Subject: [PATCH] conpty: Add a builtin conpty.dll on top of the kernelbase pseudo console.
+
+VS Code loads its bundled conpty.dll by default
+(terminal.integrated.windowsUseConptyDll), which needs the Windows console
+driver and OpenConsole.exe, so its terminal failed with "Cannot launch
+conpty". The builtin forwards to CreatePseudoConsole and friends and is
+loaded instead of the bundled one.
+---
+--- a/configure.ac
++++ b/configure.ac
+@@ -2527,6 +2527,7 @@
+ WINE_CONFIG_MAKEFILE(dlls/concrt140)
+ WINE_CONFIG_MAKEFILE(dlls/concrt140/tests)
+ WINE_CONFIG_MAKEFILE(dlls/connect)
++WINE_CONFIG_MAKEFILE(dlls/conpty)
+ WINE_CONFIG_MAKEFILE(dlls/coremessaging)
+ WINE_CONFIG_MAKEFILE(dlls/coremessaging/tests)
+ WINE_CONFIG_MAKEFILE(dlls/credui)
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -557,6 +557,7 @@
+ HKLM,%MciExtStr%,"wvx",,"MPEGVideo"
+ 
+ [Misc]
++HKCU,Software\Wine\DllOverrides,"conpty",0x2,"builtin"
+ HKLM,Software\Borland\Database Engine\Settings\SYSTEM\INIT,SHAREDMEMLOCATION,,9000
+ HKLM,Software\Clients,,16
+ HKLM,Software\Clients\Mail,,2,"Native Mail Client"
+--- a/dlls/conpty/Makefile.in
++++ b/dlls/conpty/Makefile.in
+@@ -0,0 +1,4 @@
++MODULE    = conpty.dll
++
++SOURCES = \
++	main.c
+--- a/dlls/conpty/conpty.spec
++++ b/dlls/conpty/conpty.spec
+@@ -0,0 +1,8 @@
++@ stdcall ConptyCreatePseudoConsole(long long long long ptr) kernelbase.CreatePseudoConsole
++@ stdcall ConptyResizePseudoConsole(ptr long) kernelbase.ResizePseudoConsole
++@ stdcall ConptyClosePseudoConsole(ptr) kernelbase.ClosePseudoConsole
++@ stdcall ConptyClosePseudoConsoleTimeout(ptr long)
++@ stdcall ConptyClearPseudoConsole(ptr)
++@ stdcall ConptyShowHidePseudoConsole(ptr long)
++@ stdcall ConptyReparentPseudoConsole(ptr ptr)
++@ stdcall ConptyReleasePseudoConsole(ptr)
+--- a/dlls/conpty/main.c
++++ b/dlls/conpty/main.c
+@@ -0,0 +1,59 @@
++/*
++ * conpty.dll, the redistributable ConPTY that programs like VS Code ship
++ *
++ * The real one needs the Windows console driver and OpenConsole.exe, so the
++ * pseudo console calls go to the kernelbase implementation instead.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <windows.h>
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(console);
++
++HRESULT WINAPI ConptyClosePseudoConsoleTimeout( HPCON console, DWORD timeout )
++{
++    TRACE( "%p %lu\n", console, timeout );
++    ClosePseudoConsole( console );
++    return S_OK;
++}
++
++HRESULT WINAPI ConptyClearPseudoConsole( HPCON console )
++{
++    FIXME( "%p: stub\n", console );
++    return S_OK;
++}
++
++HRESULT WINAPI ConptyShowHidePseudoConsole( HPCON console, BOOL show )
++{
++    FIXME( "%p %d: stub\n", console, show );
++    return S_OK;
++}
++
++HRESULT WINAPI ConptyReparentPseudoConsole( HPCON console, HWND parent )
++{
++    FIXME( "%p %p: stub\n", console, parent );
++    return S_OK;
++}
++
++/* lets the console go away with its last client; kernelbase's pseudo console
++ * already does that */
++HRESULT WINAPI ConptyReleasePseudoConsole( HPCON console )
++{
++    TRACE( "%p\n", console );
++    return S_OK;
++}
