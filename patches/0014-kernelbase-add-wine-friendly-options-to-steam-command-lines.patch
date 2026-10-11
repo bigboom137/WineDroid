@@ -1,4 +1,4 @@
-Subject: [PATCH] kernelbase: Add Wine-friendly options to Steam's command lines.
+Subject: [PATCH] kernelbase: Add Wine-friendly options to Steam's and Chrome's command lines.
 
 Steam's client UI is Chromium (steamwebhelper.exe). Its sandbox can't start
 renderer processes in Wine, so Steam never shows a window; Steam's own
@@ -10,47 +10,76 @@ the whole buffer, so typed text appeared, disappeared and reappeared;
 in CreateProcess, so they apply however the programs are started (steam.exe
 by its installer, its updater or the launcher, the web helper by Steam),
 unless the command line already has them.
+
+Chrome's window stays black the same way until --no-sandbox is given, and
+it draws through ANGLE and DXVK like the web helper, so it gets
+--ui-disable-partial-swap too. The options go right after the program
+name, because Chrome
+takes everything after --single-argument (used by its file associations)
+as one argument.
 ---
 --- a/dlls/kernelbase/process.c
 +++ b/dlls/kernelbase/process.c
-@@ -500,6 +500,36 @@ done:
+@@ -500,6 +500,58 @@
      return ret;
  }
  
-+/* Steam's web UI is Chromium. Its sandbox can't start renderer processes in
-+ * Wine, so Steam never shows a window; Steam's own -no-cef-sandbox turns it
++/* Steam's web UI and Chrome are Chromium. Its sandbox can't start renderer
++ * processes in Wine, so nothing is drawn (Steam never shows a window, Chrome's
++ * stays black); Steam's own -no-cef-sandbox and Chrome's --no-sandbox turn it
 + * off. Chromium also presents only the changed parts of a frame and leaves
 + * the rest of the swap chain buffer stale, which Windows' compositor never
 + * shows but DXVK does, so text flickers while it is typed; draw whole frames.
 + * Add the options however the programs are started (steam.exe by its
-+ * installer, its updater or the launcher, the web helper by Steam). */
++ * installer, its updater or the launcher, the web helper by Steam, chrome.exe
++ * by its installer or a shortcut). They go right after the program name, as
++ * Chrome takes everything after --single-argument as one argument. */
 +static WCHAR *winedroid_steam_command_line( const WCHAR *app_name, const WCHAR *cmd_line )
 +{
 +    static const struct { const WCHAR *exe, *arg; } options[] =
 +    {
 +        { L"steam.exe", L"-no-cef-sandbox" },
 +        { L"steamwebhelper.exe", L"--ui-disable-partial-swap" },
++        { L"chrome.exe", L"--no-sandbox --ui-disable-partial-swap" },
 +    };
-+    const WCHAR *p = wcsrchr( app_name, '\\' );
++    const WCHAR *p = wcsrchr( app_name, '\\' ), *args;
 +    unsigned int i;
 +    WCHAR *ret;
 +
 +    for (i = 0; i < ARRAY_SIZE(options); i++)
 +        if (!wcsicmp( p ? p + 1 : app_name, options[i].exe )) break;
-+    if (i == ARRAY_SIZE(options) || wcsstr( cmd_line, options[i].arg )) return NULL;
++    if (i == ARRAY_SIZE(options)) return NULL;
++    /* the first option is enough to tell whether they were added already */
++    p = wcschr( options[i].arg, ' ' );
 +    if (!(ret = RtlAllocateHeap( GetProcessHeap(), 0,
 +                                 (lstrlenW( cmd_line ) + lstrlenW( options[i].arg ) + 2) * sizeof(WCHAR) )))
 +        return NULL;
-+    lstrcpyW( ret, cmd_line );
-+    lstrcatW( ret, L" " );
-+    lstrcatW( ret, options[i].arg );
++    lstrcpynW( ret, options[i].arg, p ? p - options[i].arg + 1 : lstrlenW( options[i].arg ) + 1 );
++    if (wcsstr( cmd_line, ret ))
++    {
++        RtlFreeHeap( GetProcessHeap(), 0, ret );
++        return NULL;
++    }
++
++    args = cmd_line;
++    if (*args == '"')
++    {
++        if ((args = wcschr( args + 1, '"' ))) args++;
++        else args = cmd_line + lstrlenW( cmd_line );
++    }
++    else while (*args && *args != ' ' && *args != '\t') args++;
++
++    memcpy( ret, cmd_line, (args - cmd_line) * sizeof(WCHAR) );
++    ret[args - cmd_line] = ' ';
++    lstrcpyW( ret + (args - cmd_line) + 1, options[i].arg );
++    lstrcatW( ret, args );
 +    return ret;
 +}
 +
  /**********************************************************************
   *           CreateProcessInternalW   (kernelbase.@)
   */
-@@ -557,6 +587,12 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR
+@@ -557,6 +609,12 @@
          }
      }
  
