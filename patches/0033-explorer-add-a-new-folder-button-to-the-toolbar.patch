@@ -1,0 +1,71 @@
+From: WineDroid
+Subject: [PATCH] explorer: Add a New Folder button to the toolbar.
+
+New > Folder is only in the background context menu, which needs a right
+click.
+---
+--- a/programs/explorer/explorer.c
++++ b/programs/explorer/explorer.c
+@@ -73,9 +73,31 @@
+ 
+ enum
+ {
+-    BACK_BUTTON,FORWARD_BUTTON,UP_BUTTON
++    BACK_BUTTON,FORWARD_BUTTON,UP_BUTTON,NEWFOLDER_BUTTON
+ };
+ 
++/* same as New > Folder in the background context menu, which is hard to
++ * reach without a right mouse button */
++static void new_folder(explorer_info *info)
++{
++    CMINVOKECOMMANDINFO cmi = {sizeof(cmi)};
++    IContextMenu *menu;
++    IShellView *view;
++    HWND hwnd;
++
++    if (FAILED(IExplorerBrowser_GetCurrentView(info->browser, &IID_IShellView, (void **)&view)))
++        return;
++    if (SUCCEEDED(IShellView_GetWindow(view, &hwnd)) &&
++        SUCCEEDED(IShellView_GetItemObject(view, SVGIO_BACKGROUND, &IID_IContextMenu, (void **)&menu)))
++    {
++        cmi.hwnd = GetParent(hwnd); /* answers CWM_GETISHELLBROWSER */
++        cmi.lpVerb = CMDSTR_NEWFOLDERA;
++        IContextMenu_InvokeCommand(menu, &cmi);
++        IContextMenu_Release(menu);
++    }
++    IShellView_Release(view);
++}
++
+ static void variant_from_pidl(VARIANT *var, const ITEMIDLIST *pidl)
+ {
+     V_VT(var) = VT_ARRAY | VT_UI1;
+@@ -375,7 +397,7 @@
+     WCHAR explorer_title[100];
+     WCHAR pathbox_label[50];
+     TBADDBITMAP bitmap_info;
+-    TBBUTTON nav_buttons[3];
++    TBBUTTON nav_buttons[4];
+     int hist_offset,view_offset;
+     REBARBANDINFOW band_info;
+     VARIANT var, empty_var;
+@@ -504,6 +526,10 @@
+     nav_buttons[2].idCommand=UP_BUTTON;
+     nav_buttons[2].fsState=TBSTATE_ENABLED;
+     nav_buttons[2].fsStyle=BTNS_BUTTON|BTNS_AUTOSIZE;
++    nav_buttons[3].iBitmap=view_offset+VIEW_NEWFOLDER;
++    nav_buttons[3].idCommand=NEWFOLDER_BUTTON;
++    nav_buttons[3].fsState=TBSTATE_ENABLED;
++    nav_buttons[3].fsStyle=BTNS_BUTTON|BTNS_AUTOSIZE;
+     SendMessageW(nav_toolbar,TB_BUTTONSTRUCTSIZE,sizeof(TBBUTTON),0);
+     SendMessageW(nav_toolbar,TB_ADDBUTTONSW,ARRAY_SIZE( nav_buttons ),(LPARAM)nav_buttons);
+ 
+@@ -741,6 +767,9 @@
+             case UP_BUTTON:
+                 IExplorerBrowser_BrowseToObject(browser,NULL,SBSP_PARENT);
+                 break;
++            case NEWFOLDER_BUTTON:
++                new_folder(info);
++                break;
+             }
+         }
+         break;

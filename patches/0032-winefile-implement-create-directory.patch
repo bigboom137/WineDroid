@@ -1,0 +1,71 @@
+From: WineDroid
+Subject: [PATCH] winefile: Implement Create Directory.
+
+The File menu item only showed a "not implemented" message.
+---
+--- a/programs/winefile/winefile.c
++++ b/programs/winefile/winefile.c
+@@ -3624,6 +3624,33 @@
+ 						refresh_child(child);
+ 					break;}
+ 
++				case ID_MKDIR: {
++					WCHAR name[MAX_PATH], path[BUFFER_LEN];
++					int len;
++
++					lstrcpyW(name, L"New Folder");
++
++					if (DialogBoxParamW(Globals.hInstance, MAKEINTRESOURCEW(IDD_CREATE_DIRECTORY), hwnd, DestinationDlgProc, (LPARAM)name) != IDOK || !name[0])
++						break;
++
++					/* relative names are created in the current directory */
++					if (name[0]!='/' && name[0]!='\\' && name[1]!=':') {
++						lstrcpyW(path, child->path);
++						len = lstrlenW(path);
++
++						if (len && path[len-1]!='\\' && path[len-1]!='/')
++							path[len++] = '\\';
++
++						lstrcpyW(path+len, name);
++					} else
++						lstrcpyW(path, name);
++
++					if (CreateDirectoryW(path, NULL))
++						refresh_child(child);
++					else
++						display_error(hwnd, GetLastError());
++					break;}
++
+ 				case ID_VIEW_SORT_NAME:
+ 					set_sort_order(child, SORT_NAME);
+ 					break;
+--- a/programs/winefile/winefile.rc
++++ b/programs/winefile/winefile.rc
+@@ -128,6 +128,17 @@
+     PUSHBUTTON      "&Browse...", 254, 145, 43, 60, 14
+ }
+ 
++IDD_CREATE_DIRECTORY DIALOG 15, 13, 210, 46
++STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
++CAPTION "Create Directory"
++FONT 8, "MS Shell Dlg"
++{
++    CONTROL         "&Name:", -1, "Static", SS_LEFTNOWORDWRAP|WS_GROUP, 3, 6, 60, 10
++    EDITTEXT        201, 3, 17, 134, 12, ES_AUTOHSCROLL
++    DEFPUSHBUTTON   "OK", 1, 145, 6, 60, 14
++    PUSHBUTTON      "Cancel", 2, 145, 23, 60, 14
++}
++
+ IDD_DIALOG_VIEW_TYPE DIALOG 15, 13, 161, 105
+ STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+ CAPTION "By File Type"
+--- a/programs/winefile/resource.h
++++ b/programs/winefile/resource.h
+@@ -38,6 +38,7 @@
+ #define IDD_SELECT_DESTINATION          104
+ #define IDD_DIALOG_VIEW_TYPE            105
+ #define IDD_DIALOG_PROPERTIES           106
++#define IDD_CREATE_DIRECTORY            107
+ 
+ 
+ /* control ids */
