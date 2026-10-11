@@ -1,0 +1,1536 @@
+From: WineDroid
+Subject: [PATCH] explorer: Add desktop icons, a flat taskbar and program search on Android.
+
+- Desktop icons for everything in the desktop folders, including Steam's
+  .url shortcuts and folders; a tap selects, a second tap opens.
+- Dark flat taskbar with program icons, an accent bar under the active
+  window, a clock and a key for WineDroid's on-screen keyboard button.
+- A Search field that lists Start menu, desktop and built-in programs,
+  filters as you type and runs commands.
+- The desktop stays when started as one (WINEDROID_KEEP_DESKTOP).
+---
+--- a/programs/explorer/desktop.c
++++ b/programs/explorer/desktop.c
+@@ -59,11 +59,19 @@
+ 
+ static int icon_cx, icon_cy, icon_offset_cx, icon_offset_cy;
+ static int title_cx, title_cy, title_offset_cx, title_offset_cy;
+-static int desktop_width, launcher_size, launchers_per_row;
++static int desktop_width, launcher_size, launchers_per_row, launcher_margin;
+ 
+ static struct launcher **launchers;
+ static unsigned int nb_launchers, nb_allocated;
+ 
++/* the Android driver shows the wallpaper through the desktop pixels of this color */
++#define DESKTOP_COLOR_KEY RGB( 0x01, 0x02, 0x01 )  /* same in COLORREF and DIB byte order */
++
++/* on Android a tap selects a launcher and a second one starts it, since taps
++ * rarely land close enough together for a double click */
++static const struct launcher *selected_launcher;
++static DWORD selected_time;
++
+ static REFIID tid_ids[] =
+ {
+     &IID_IShellWindows,
+@@ -210,15 +218,41 @@
+ static void shellwindows_init(void);
+ static void desktopshellbrowserwindow_init(void);
+ 
++/* get the cell of a launcher; Android lays them out in columns from the top
++ * left corner like Windows does, other desktops in rows */
++static void get_launcher_cell( unsigned int index, unsigned int *col, unsigned int *row )
++{
++    if (paint_root)
++    {
++        HWND tray = FindWindowW( L"Shell_TrayWnd", NULL );
++        int height = GetSystemMetrics( SM_CYSCREEN );
++        unsigned int per_column;
++        RECT rect;
++
++        /* the work area isn't updated here when the Android window size arrives */
++        if (tray && IsWindowVisible( tray ) && GetWindowRect( tray, &rect ) && rect.top > 0)
++            height = min( height, rect.top );
++        per_column = max( 1, (height - 2 * launcher_margin) / launcher_size );
++        *col = index / per_column;
++        *row = index % per_column;
++    }
++    else
++    {
++        *row = index / launchers_per_row;
++        *col = index % launchers_per_row;
++    }
++}
++
+ static RECT get_icon_rect( unsigned int index )
+ {
+     RECT rect;
+-    unsigned int row = index / launchers_per_row;
+-    unsigned int col = index % launchers_per_row;
++    unsigned int row, col;
++
++    get_launcher_cell( index, &col, &row );
+ 
+-    rect.left   = col * launcher_size + icon_offset_cx;
++    rect.left   = col * launcher_size + icon_offset_cx + launcher_margin;
+     rect.right  = rect.left + icon_cx;
+-    rect.top    = row * launcher_size + icon_offset_cy;
++    rect.top    = row * launcher_size + icon_offset_cy + launcher_margin;
+     rect.bottom = rect.top + icon_cy;
+     return rect;
+ }
+@@ -226,12 +260,13 @@
+ static RECT get_title_rect( unsigned int index )
+ {
+     RECT rect;
+-    unsigned int row = index / launchers_per_row;
+-    unsigned int col = index % launchers_per_row;
++    unsigned int row, col;
++
++    get_launcher_cell( index, &col, &row );
+ 
+-    rect.left   = col * launcher_size + title_offset_cx;
++    rect.left   = col * launcher_size + title_offset_cx + launcher_margin;
+     rect.right  = rect.left + title_cx;
+-    rect.top    = row * launcher_size + title_offset_cy;
++    rect.top    = row * launcher_size + title_offset_cy + launcher_margin;
+     rect.bottom = rect.top + title_cy;
+     return rect;
+ }
+@@ -242,14 +277,57 @@
+     unsigned int index;
+ 
+     if (!nb_launchers) return NULL;
+-    index = x / launcher_size + (y / launcher_size) * launchers_per_row;
+-    if (index >= nb_launchers) return NULL;
++    for (index = 0; index < nb_launchers; index++)
++    {
++        icon = get_icon_rect( index );
++        title = get_title_rect( index );
++        if ((x < icon.left || x > icon.right || y < icon.top || y > icon.bottom) &&
++            (x < title.left || x > title.right || y < title.top || y > title.bottom)) continue;
++        return launchers[index];
++    }
++    return NULL;
++}
++
++static RECT get_launcher_rect( const struct launcher *launcher )
++{
++    RECT rect = {0}, title;
++    unsigned int i;
++
++    for (i = 0; i < nb_launchers; i++)
++    {
++        if (launchers[i] != launcher) continue;
++        rect = get_icon_rect( i );
++        title = get_title_rect( i );
++        UnionRect( &rect, &rect, &title );
++        InflateRect( &rect, 2, 2 );
++        break;
++    }
++    return rect;
++}
+ 
+-    icon = get_icon_rect( index );
+-    title = get_title_rect( index );
+-    if ((x < icon.left || x > icon.right || y < icon.top || y > icon.bottom) &&
+-        (x < title.left || x > title.right || y < title.top || y > title.bottom)) return NULL;
+-    return launchers[index];
++static void click_launcher( HWND hwnd, int x, int y, DWORD time )
++{
++    const struct launcher *launcher = launcher_from_point( x, y );
++    RECT rect;
++
++    if (launcher && launcher == selected_launcher && time - selected_time <= GetDoubleClickTime())
++    {
++        ShellExecuteW( NULL, L"open", launcher->path, NULL, NULL, SW_SHOWNORMAL );
++        selected_time = time - GetDoubleClickTime() - 1;
++        return;
++    }
++    if (selected_launcher)
++    {
++        rect = get_launcher_rect( selected_launcher );
++        InvalidateRect( hwnd, &rect, TRUE );
++    }
++    selected_launcher = launcher;
++    selected_time = time;
++    if (launcher)
++    {
++        rect = get_launcher_rect( launcher );
++        InvalidateRect( hwnd, &rect, TRUE );
++    }
+ }
+ 
+ static void draw_launchers( HDC hdc, RECT update_rect )
+@@ -267,13 +345,38 @@
+     {
+         RECT dummy, icon = get_icon_rect( i ), title = get_title_rect( i );
+ 
++        if (paint_root && launchers[i] == selected_launcher)
++        {
++            RECT rect = get_launcher_rect( launchers[i] );
++            HBRUSH brush = CreateSolidBrush( RGB(52, 92, 150) );
++            HPEN pen = SelectObject( hdc, CreatePen( PS_SOLID, 1, RGB(92, 140, 210) ));
++
++            brush = SelectObject( hdc, brush );
++            RoundRect( hdc, rect.left, rect.top, rect.right, rect.bottom, 8, 8 );
++            DeleteObject( SelectObject( hdc, brush ));
++            DeleteObject( SelectObject( hdc, pen ));
++        }
++
+         if (IntersectRect( &dummy, &icon, &update_rect ))
+             DrawIconEx( hdc, icon.left, icon.top, launchers[i]->icon, icon_cx, icon_cy,
+                         0, 0, DI_DEFAULTSIZE|DI_NORMAL );
+ 
+         if (IntersectRect( &dummy, &title, &update_rect ))
++        {
++            /* the wallpaper can be light, a shadow keeps the titles readable */
++            if (paint_root)
++            {
++                RECT shadow = title;
++
++                OffsetRect( &shadow, 1, 1 );
++                SetTextColor( hdc, RGB(0, 0, 0) );
++                DrawTextW( hdc, launchers[i]->title, -1, &shadow,
++                           DT_CENTER|DT_WORDBREAK|DT_EDITCONTROL|DT_END_ELLIPSIS );
++                SetTextColor( hdc, RGB(255, 255, 255) );
++            }
+             DrawTextW( hdc, launchers[i]->title, -1, &title,
+                        DT_CENTER|DT_WORDBREAK|DT_EDITCONTROL|DT_END_ELLIPSIS );
++        }
+     }
+ 
+     font = SelectObject( hdc, font );
+@@ -363,10 +466,43 @@
+     return ret;
+ }
+ 
++static BOOL is_url_file( const WCHAR *path )
++{
++    const WCHAR *ext = wcsrchr( path, '.' );
++    return ext && !wcsicmp( ext, L".url" );
++}
++
++static HICON extract_url_icon( const WCHAR *path )
++{
++    WCHAR tmp_path[MAX_PATH], icon_path[MAX_PATH];
++    SHFILEINFOW info;
++    HICON icon = NULL;
++    int index;
++
++    GetPrivateProfileStringW( L"InternetShortcut", L"IconFile", L"", tmp_path, MAX_PATH, path );
++    index = GetPrivateProfileIntW( L"InternetShortcut", L"IconIndex", 0, path );
++    ExpandEnvironmentStringsW( tmp_path, icon_path, MAX_PATH );
++    if (icon_path[0]) ExtractIconExW( icon_path, index, &icon, NULL, 1 );
++    if (!icon && SHGetFileInfoW( path, 0, &info, sizeof(info), SHGFI_ICON | SHGFI_LARGEICON ))
++        icon = info.hIcon;
++    if (!icon) icon = CopyIcon( LoadIconW( 0, (const WCHAR *)IDI_APPLICATION ));
++    return icon;
++}
++
+ static BOOL add_launcher( const WCHAR *folder, const WCHAR *filename, int len_filename )
+ {
+     struct launcher *launcher;
+     IShellLinkW *link;
++    int len = len_filename == -1 ? lstrlenW( filename ) : len_filename;
++
++    /* shell links; Android has no file manager desktop around it, so it shows
++     * everything in the desktop folder like Windows does */
++    if (paint_root)
++    {
++        if (!len || filename[0] == '.') return FALSE;
++        if (len == 11 && !wcsnicmp( filename, L"desktop.ini", 11 )) return FALSE;
++    }
++    else if (len < 4 || wcsnicmp( filename + len - 4, L".lnk", 4 )) return FALSE;
+ 
+     if (nb_launchers == nb_allocated)
+     {
+@@ -379,11 +515,41 @@
+ 
+     if (!(launcher = malloc( sizeof(*launcher) ))) return FALSE;
+     if (!(launcher->path = append_path( folder, filename, len_filename ))) goto error;
+-    if (!(link = load_shelllink( launcher->path ))) goto error;
+-
+-    launcher->icon = extract_icon( link );
++    link = NULL;
++    if (paint_root && is_url_file( launcher->path ))
++    {
++        /* internet shortcuts, which is what Steam puts on the desktop */
++        launcher->icon = extract_url_icon( launcher->path );
++    }
++    else if (paint_root && (len < 4 || wcsnicmp( filename + len - 4, L".lnk", 4 )))
++    {
++        SHFILEINFOW info;
++        DWORD attr = GetFileAttributesW( launcher->path );
++
++        if (attr == INVALID_FILE_ATTRIBUTES || (attr & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))) goto error;
++        launcher->icon = NULL;
++        if (SHGetFileInfoW( launcher->path, 0, &info, sizeof(info), SHGFI_ICON | SHGFI_LARGEICON ))
++            launcher->icon = info.hIcon;
++        if (!launcher->icon) launcher->icon = CopyIcon( LoadIconW( 0, (const WCHAR *)IDI_APPLICATION ));
++        /* folder names keep their dots */
++        if (attr & FILE_ATTRIBUTE_DIRECTORY)
++        {
++            if ((launcher->title = malloc( (len + 1) * sizeof(WCHAR) )))
++            {
++                memcpy( launcher->title, filename, len * sizeof(WCHAR) );
++                launcher->title[len] = 0;
++            }
++            goto done;
++        }
++    }
++    else
++    {
++        if (!(link = load_shelllink( launcher->path ))) goto error;
++        launcher->icon = extract_icon( link );
++    }
+     launcher->title = build_title( filename, len_filename );
+-    IShellLinkW_Release( link );
++done:
++    if (link) IShellLinkW_Release( link );
+     if (launcher->icon && launcher->title)
+     {
+         launchers[nb_launchers++] = launcher;
+@@ -417,6 +583,7 @@
+     {
+         if (!wcsicmp( launchers[i]->path, path ))
+         {
++            if (launchers[i] == selected_launcher) selected_launcher = NULL;
+             free_launcher( launchers[i] );
+             if (--nb_launchers)
+                 memmove( &launchers[i], &launchers[i + 1], sizeof(launchers[i]) * (nb_launchers - i) );
+@@ -503,13 +670,13 @@
+ 
+     for (;;)
+     {
+-        ret = ReadDirectoryChangesW( dir0, buf0, size, FALSE, FILE_NOTIFY_CHANGE_FILE_NAME, NULL, &ovl0, NULL );
++        ret = ReadDirectoryChangesW( dir0, buf0, size, FALSE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME, NULL, &ovl0, NULL );
+         if (!ret)
+         {
+             error = GetLastError();
+             goto error;
+         }
+-        ret = ReadDirectoryChangesW( dir1, buf1, size, FALSE, FILE_NOTIFY_CHANGE_FILE_NAME, NULL, &ovl1, NULL );
++        ret = ReadDirectoryChangesW( dir1, buf1, size, FALSE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME, NULL, &ovl1, NULL );
+         if (!ret)
+         {
+             error = GetLastError();
+@@ -548,7 +715,8 @@
+ 
+ static void add_folder( const WCHAR *folder )
+ {
+-    static const WCHAR lnkW[] = L"\\*.lnk";
++    /* add_launcher picks the shortcuts */
++    static const WCHAR lnkW[] = L"\\*";
+     int len = lstrlenW( folder ) + lstrlenW( lnkW );
+     WIN32_FIND_DATAW data;
+     HANDLE handle;
+@@ -589,6 +757,7 @@
+     title_offset_cx = BORDER_SIZE;
+     title_offset_cy = BORDER_SIZE + icon_size + PADDING_SIZE;
+     desktop_width = GetSystemMetrics( SM_CXSCREEN );
++    if (paint_root) launcher_margin = GetSystemMetrics( SM_CXSMICON ) / 2;
+     launchers_per_row = desktop_width / launcher_size;
+     if (!launchers_per_row) launchers_per_row = 1;
+ 
+@@ -792,6 +961,22 @@
+ 
+ static WNDPROC desktop_orig_wndproc;
+ 
++BOOL is_android_desktop(void)
++{
++    return paint_root;
++}
++
++/* the driver makes the key color transparent, so the wallpaper shows there */
++static void paint_android_desktop( HWND hwnd, HDC hdc )
++{
++    HBRUSH brush = CreateSolidBrush( DESKTOP_COLOR_KEY );
++    RECT rect;
++
++    GetClientRect( hwnd, &rect );
++    FillRect( hdc, &rect, brush );
++    DeleteObject( brush );
++}
++
+ /* window procedure for the desktop window */
+ static LRESULT WINAPI desktop_wnd_proc( HWND hwnd, UINT message, WPARAM wp, LPARAM lp )
+ {
+@@ -807,6 +992,8 @@
+         {
+             HWND tray = FindWindowW( L"Shell_TrayWnd", NULL );
+             if (tray) PostMessageW( tray, WM_DISPLAYCHANGE, wp, lp );
++            /* the launcher columns depend on the screen height */
++            InvalidateRect( hwnd, NULL, TRUE );
+         }
+         break;
+     case WM_SYSCOMMAND:
+@@ -829,7 +1016,8 @@
+         return HTCLIENT;
+ 
+     case WM_ERASEBKGND:
+-        if (!using_root || paint_root) PaintDesktop( (HDC)wp );
++        if (paint_root && launchers) paint_android_desktop( hwnd, (HDC)wp );
++        else if (!using_root || paint_root) PaintDesktop( (HDC)wp );
+         return TRUE;
+ 
+     case WM_SETTINGCHANGE:
+@@ -841,7 +1029,16 @@
+         handle_parent_notify( (HWND)lp, wp );
+         return 0;
+ 
++    case WM_LBUTTONDOWN:
++        if (paint_root) click_launcher( hwnd, (short)LOWORD(lp), (short)HIWORD(lp), GetMessageTime() );
++        return 0;
++
+     case WM_LBUTTONDBLCLK:
++        if (paint_root)
++        {
++            click_launcher( hwnd, (short)LOWORD(lp), (short)HIWORD(lp), GetMessageTime() );
++            return 0;
++        }
+         if (!using_root)
+         {
+             const struct launcher *launcher = launcher_from_point( (short)LOWORD(lp), (short)HIWORD(lp) );
+@@ -858,6 +1055,11 @@
+                 PaintDesktop( ps.hdc );
+                 draw_launchers( ps.hdc, ps.rcPaint );
+             }
++            else if (paint_root && launchers)
++            {
++                paint_android_desktop( hwnd, ps.hdc );
++                draw_launchers( ps.hdc, ps.rcPaint );
++            }
+             else if (paint_root) PaintDesktop( ps.hdc );
+             EndPaint( hwnd, &ps );
+         }
+@@ -1373,7 +1575,12 @@
+          * close it before their child attaches, so allow a grace period */
+         if (paint_root)
+         {
++            WCHAR keep[2];
+             DWORD timeout = 3000;
++
++            /* WineDroid started as a desktop, it stays until the app is closed */
++            if (GetEnvironmentVariableW( L"WINEDROID_KEEP_DESKTOP", keep, ARRAY_SIZE(keep) ) == 1 && keep[0] == '1')
++                timeout = INFINITE;
+             SetUserObjectInformationW( desktop, 1000, &timeout, sizeof(timeout) );
+         }
+     }
+@@ -1408,7 +1615,7 @@
+ 
+         /* the Android root desktop has no host taskbar, so it can have Wine's */
+         initialize_systray( using_root && !(paint_root && enable_shell), enable_shell, show_systray, no_tray_items );
+-        if (!using_root && enable_launchers) initialize_launchers( hwnd );
++        if ((!using_root || paint_root) && enable_launchers) initialize_launchers( hwnd );
+ 
+         if ((shell32 = LoadLibraryW( L"shell32.dll" )) &&
+             (pShellDDEInit = (void *)GetProcAddress( shell32, (LPCSTR)188)))
+@@ -1472,7 +1679,11 @@
+         start_xalia_process();
+ 
+         TRACE( "desktop message loop starting on hwnd %p\n", hwnd );
+-        while (GetMessageW( &msg, 0, 0, 0 )) DispatchMessageW( &msg );
++        while (GetMessageW( &msg, 0, 0, 0 ))
++        {
++            TranslateMessage( &msg );  /* the taskbar search field needs WM_CHAR */
++            DispatchMessageW( &msg );
++        }
+         TRACE( "desktop message loop exiting for hwnd %p\n", hwnd );
+     }
+ 
+--- a/programs/explorer/systray.c
++++ b/programs/explorer/systray.c
+@@ -101,6 +101,7 @@
+     HWND        button;
+     BOOL        active;
+     BOOL        visible;
++    HICON       exe_icon;  /* icon of the program, when the window has none we can get */
+ };
+ 
+ static struct list taskbar_buttons = LIST_INIT( taskbar_buttons );
+@@ -118,6 +119,23 @@
+ static int start_button_width, taskbar_button_width;
+ static WCHAR start_label[50];
+ 
++/* flat dark look of the full taskbar */
++static HWND search_button;
++static int search_button_width, clock_width, keyboard_width;
++static HFONT taskbar_font;
++static WCHAR clock_time[32], clock_date[32];
++
++#define TASKBAR_BG      RGB(28, 30, 36)
++#define TASKBAR_EDGE    RGB(54, 58, 68)
++#define TASKBAR_ACTIVE  RGB(56, 61, 74)
++#define TASKBAR_PRESSED RGB(72, 78, 94)
++#define TASKBAR_ACCENT  RGB(76, 154, 255)
++#define TASKBAR_TEXT    RGB(236, 238, 243)
++#define TASKBAR_DIM     RGB(160, 165, 178)
++#define TASKBAR_FIELD   RGB(45, 48, 57)
++
++#define CLOCK_TIMER 100
++
+ static struct icon *balloon_icon;
+ static HWND balloon_window;
+ static POINT balloon_pos;
+@@ -342,7 +360,7 @@
+ 
+     if (enable_taskbar)
+     {
+-        pos.x = tray_width - icon_cx * (icon->display + 1);
++        pos.x = tray_width - clock_width - icon_cx * (icon->display + 1);
+         pos.y = (tray_height - icon_cy) / 2;
+     }
+     else
+@@ -520,6 +538,19 @@
+         if (icon->layered) paint_layered_icon( icon );
+         break;
+ 
++    case WM_ERASEBKGND:
++        if (enable_taskbar && !icon->layered)
++        {
++            HBRUSH brush = CreateSolidBrush( TASKBAR_BG );
++            RECT rc;
++
++            GetClientRect( hwnd, &rc );
++            FillRect( (HDC)wparam, &rc, brush );
++            DeleteObject( brush );
++            return 1;
++        }
++        break;
++
+     case WM_PAINT:
+     {
+         PAINTSTRUCT ps;
+@@ -805,7 +836,7 @@
+     struct taskbar_button *win;
+     int pos = 0, count = 0;
+     int width = taskbar_button_width;
+-    int right = tray_width - nb_displayed * icon_cx;
++    int right = tray_width - clock_width - nb_displayed * icon_cx;
+     HWND foreground = GetAncestor( GetForegroundWindow(), GA_ROOTOWNER );
+ 
+     if (!enable_taskbar) return;
+@@ -818,6 +849,13 @@
+             SetWindowPos( win->button, 0, pos, 0, start_button_width, tray_height,
+                           SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW );
+             pos += start_button_width;
++            if (search_button)
++            {
++                int margin = tray_height / 6;
++                SetWindowPos( search_button, 0, pos + margin, margin, search_button_width,
++                              tray_height - 2 * margin, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW );
++                pos += search_button_width + 2 * margin;
++            }
+             continue;
+         }
+         win->active = (win->hwnd == foreground);
+@@ -962,6 +1000,7 @@
+ 
+     if (!(win = malloc( sizeof(*win) ))) return;
+     win->hwnd = hwnd;
++    win->exe_icon = NULL;
+     win->button = CreateWindowW( WC_BUTTONW, NULL, WS_CHILD | BS_OWNERDRAW,
+                                  0, 0, 0, 0, tray_window, (HMENU)hwnd, 0, 0 );
+     list_add_tail( &taskbar_buttons, &win->entry );
+@@ -984,16 +1023,213 @@
+     if (!win) return;
+     list_remove( &win->entry );
+     DestroyWindow( win->button );
++    if (win->exe_icon) DestroyIcon( win->exe_icon );
+     free( win );
+ }
+ 
++static void fill_round_rect( HDC hdc, const RECT *rect, int radius, COLORREF color )
++{
++    HBRUSH brush = SelectObject( hdc, CreateSolidBrush( color ));
++    HPEN pen = SelectObject( hdc, GetStockObject( NULL_PEN ));
++
++    RoundRect( hdc, rect->left, rect->top, rect->right + 1, rect->bottom + 1, radius, radius );
++    DeleteObject( SelectObject( hdc, brush ));
++    SelectObject( hdc, pen );
++}
++
++static void fill_color( HDC hdc, const RECT *rect, COLORREF color )
++{
++    HBRUSH brush = CreateSolidBrush( color );
++    FillRect( hdc, rect, brush );
++    DeleteObject( brush );
++}
++
++static HICON get_window_icon( HWND hwnd )
++{
++    DWORD_PTR icon = 0;
++
++    if (!SendMessageTimeoutW( hwnd, WM_GETICON, ICON_SMALL2, 0, SMTO_ABORTIFHUNG, 100, &icon )) icon = 0;
++    if (!icon && !SendMessageTimeoutW( hwnd, WM_GETICON, ICON_BIG, 0, SMTO_ABORTIFHUNG, 100, &icon )) icon = 0;
++    if (!icon) icon = GetClassLongPtrW( hwnd, GCLP_HICONSM );
++    if (!icon) icon = GetClassLongPtrW( hwnd, GCLP_HICON );
++    return (HICON)icon;
++}
++
++/* WM_GETICON can't cross processes in Wine, so most windows need their program's icon */
++static HICON get_button_icon( struct taskbar_button *win )
++{
++    HICON icon = get_window_icon( win->hwnd );
++    WCHAR path[MAX_PATH];
++    DWORD pid, size = ARRAY_SIZE(path);
++    HANDLE process;
++
++    if (icon) return icon;
++    if (!win->exe_icon && GetWindowThreadProcessId( win->hwnd, &pid ) &&
++        (process = OpenProcess( PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid )))
++    {
++        if (QueryFullProcessImageNameW( process, 0, path, &size ))
++            ExtractIconExW( path, 0, NULL, &win->exe_icon, 1 );
++        CloseHandle( process );
++        if (!win->exe_icon) win->exe_icon = CopyIcon( LoadIconW( 0, (const WCHAR *)IDI_APPLICATION ));
++    }
++    return win->exe_icon;
++}
++
++static void paint_flat_button( const DRAWITEMSTRUCT *dis, struct taskbar_button *win )
++{
++    int unit = GetSystemMetrics( SM_CXSMICON ), radius = unit / 2;
++    WCHAR title[256];
++    HICON icon;
++    RECT rect;
++
++    GetClientRect( dis->hwndItem, &rect );
++    fill_color( dis->hDC, &rect, TASKBAR_BG );
++    SelectObject( dis->hDC, taskbar_font );
++    SetBkMode( dis->hDC, TRANSPARENT );
++
++    if (dis->hwndItem == search_button)
++    {
++        fill_round_rect( dis->hDC, &rect, rect.bottom - rect.top,
++                         (dis->itemState & ODS_SELECTED) ? TASKBAR_PRESSED : TASKBAR_FIELD );
++        draw_search_glyph( dis->hDC, rect.left + unit * 3 / 4, (rect.bottom - unit * 3 / 4) / 2,
++                           unit * 3 / 4, TASKBAR_DIM );
++        rect.left += unit * 2;
++        SetTextColor( dis->hDC, TASKBAR_DIM );
++        DrawTextW( dis->hDC, L"Search", -1, &rect, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS );
++        return;
++    }
++
++    InflateRect( &rect, -2, -unit / 4 );
++    if (dis->itemState & ODS_SELECTED) fill_round_rect( dis->hDC, &rect, radius, TASKBAR_PRESSED );
++    else if (win->hwnd && win->active) fill_round_rect( dis->hDC, &rect, radius, TASKBAR_ACTIVE );
++
++    if (win->hwnd)
++    {
++        icon = get_button_icon( win );
++        if (!InternalGetWindowText( win->hwnd, title, ARRAY_SIZE(title) )) title[0] = 0;
++
++        /* a bar under every open window, a long accent one under the active one */
++        if (!IsIconic( win->hwnd ))
++        {
++            RECT bar = rect;
++            int width = win->active ? (rect.right - rect.left) / 3 : unit;
++
++            bar.left = (rect.left + rect.right - width) / 2;
++            bar.right = bar.left + width;
++            bar.top = rect.bottom - max( 2, unit / 6 );
++            fill_round_rect( dis->hDC, &bar, max( 2, unit / 6 ), win->active ? TASKBAR_ACCENT : TASKBAR_DIM );
++        }
++    }
++    else  /* start button: a grid of four tiles */
++    {
++        int tile = unit * 7 / 16, gap = max( 1, unit / 8 );
++        int x = rect.left + unit / 2, y = (rect.top + rect.bottom - unit) / 2;
++        RECT part;
++
++        icon = NULL;
++        lstrcpynW( title, start_label, ARRAY_SIZE(title) );
++        for (int i = 0; i < 4; i++)
++        {
++            SetRect( &part, x + (i % 2) * (tile + gap), y + (i / 2) * (tile + gap), 0, 0 );
++            part.right = part.left + tile;
++            part.bottom = part.top + tile;
++            fill_round_rect( dis->hDC, &part, max( 2, unit / 6 ), TASKBAR_ACCENT );
++        }
++    }
++
++    if (icon) DrawIconEx( dis->hDC, rect.left + unit / 2, (rect.top + rect.bottom - unit) / 2, icon,
++                          unit, unit, 0, 0, DI_NORMAL );
++    rect.left += unit * 2;
++    rect.right -= unit / 2;
++    SetTextColor( dis->hDC, (win->hwnd && !win->active) ? TASKBAR_DIM : TASKBAR_TEXT );
++    if (!win->hwnd) SetTextColor( dis->hDC, TASKBAR_TEXT );
++    DrawTextW( dis->hDC, title, -1, &rect, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS );
++}
++
++static void update_clock( BOOL redraw )
++{
++    WCHAR time[32], date[32];
++    RECT rect;
++
++    if (!GetTimeFormatEx( NULL, TIME_NOSECONDS, NULL, NULL, time, ARRAY_SIZE(time) )) time[0] = 0;
++    if (!GetDateFormatEx( NULL, DATE_SHORTDATE, NULL, NULL, date, ARRAY_SIZE(date), NULL )) date[0] = 0;
++    if (!wcscmp( time, clock_time ) && !wcscmp( date, clock_date )) return;
++    lstrcpyW( clock_time, time );
++    lstrcpyW( clock_date, date );
++    if (!redraw) return;
++    SetRect( &rect, tray_width - clock_width, 0, tray_width, tray_height );
++    InvalidateRect( tray_window, &rect, TRUE );
++}
++
++static void paint_taskbar( HWND hwnd )
++{
++    PAINTSTRUCT ps;
++    RECT rect;
++    HDC hdc = BeginPaint( hwnd, &ps );
++    int unit = GetSystemMetrics( SM_CXSMICON );
++
++    GetClientRect( hwnd, &rect );
++    fill_color( hdc, &rect, TASKBAR_BG );
++    rect.bottom = rect.top + 1;
++    fill_color( hdc, &rect, TASKBAR_EDGE );
++
++    /* WineDroid's on-screen keyboard button is a transparent Android view over this key */
++    if (keyboard_width)
++    {
++        RECT key, dot;
++        int x, y, w = unit * 5 / 4, h = unit * 7 / 8, d = max( 1, unit / 8 );
++        HPEN pen = SelectObject( hdc, CreatePen( PS_SOLID, max( 1, unit / 12 ), TASKBAR_DIM ));
++        HBRUSH brush = SelectObject( hdc, GetStockObject( NULL_BRUSH ));
++
++        SetRect( &key, tray_width - keyboard_width, 0, tray_width, tray_height );
++        x = (key.left + key.right - w) / 2;
++        y = (key.top + key.bottom - h) / 2;
++        RoundRect( hdc, x, y, x + w, y + h, d * 2, d * 2 );
++        SelectObject( hdc, brush );
++        DeleteObject( SelectObject( hdc, pen ));
++        for (int row = 0; row < 2; row++)
++            for (int col = 0; col < 4; col++)
++            {
++                SetRect( &dot, x + w * (col + 1) / 5 - d / 2, y + h * (row + 1) / 4 - d / 2, 0, 0 );
++                dot.right = dot.left + d;
++                dot.bottom = dot.top + d;
++                fill_color( hdc, &dot, TASKBAR_DIM );
++            }
++        SetRect( &dot, x + w / 4, y + h * 3 / 4 - d / 2, x + w * 3 / 4, 0 );
++        dot.bottom = dot.top + d;
++        fill_color( hdc, &dot, TASKBAR_DIM );
++    }
++
++    SetRect( &rect, tray_width - clock_width, 0, tray_width - keyboard_width - unit / 2, tray_height );
++    SelectObject( hdc, taskbar_font );
++    SetBkMode( hdc, TRANSPARENT );
++    rect.bottom = tray_height / 2 + 1;
++    SetTextColor( hdc, TASKBAR_TEXT );
++    DrawTextW( hdc, clock_time, -1, &rect, DT_SINGLELINE | DT_BOTTOM | DT_CENTER | DT_NOPREFIX );
++    rect.top = rect.bottom;
++    rect.bottom = tray_height;
++    SetTextColor( hdc, TASKBAR_DIM );
++    DrawTextW( hdc, clock_date, -1, &rect, DT_SINGLELINE | DT_TOP | DT_CENTER | DT_NOPREFIX );
++    EndPaint( hwnd, &ps );
++}
++
+ static void paint_taskbar_button( const DRAWITEMSTRUCT *dis )
+ {
+     RECT rect;
+     UINT flags = DC_TEXT;
+-    struct taskbar_button *win = find_taskbar_button( LongToHandle( dis->CtlID ));
++    struct taskbar_button *win;
+ 
+-    if (!win) return;
++    if (dis->hwndItem == search_button)
++    {
++        paint_flat_button( dis, NULL );
++        return;
++    }
++    if (!(win = find_taskbar_button( LongToHandle( dis->CtlID )))) return;
++    if (taskbar_font)
++    {
++        paint_flat_button( dis, win );
++        return;
++    }
+     GetClientRect( dis->hwndItem, &rect );
+     DrawFrameControl( dis->hDC, &rect, DFC_BUTTON, DFCS_BUTTONPUSH | DFCS_ADJUSTRECT |
+                       ((dis->itemState & ODS_SELECTED) ? DFCS_PUSHED : 0 ));
+@@ -1011,8 +1247,15 @@
+     LONG_PTR id = GetWindowLongPtrW( button, GWLP_ID );
+     HWND hwnd = (HWND)id;
+ 
++    if (button == search_button)
++    {
++        toggle_search( button );
++        return;
++    }
++
+     if (!hwnd)  /* start button */
+     {
++        if (is_search_open()) toggle_search( search_button );
+         do_startmenu( tray_window );
+         return;
+     }
+@@ -1077,6 +1320,8 @@
+ 
+     ncm.cbSize = sizeof(NONCLIENTMETRICSW);
+     SystemParametersInfoW( SPI_GETNONCLIENTMETRICS, sizeof(NONCLIENTMETRICSW), &ncm, 0 );
++    if (taskbar_font) DeleteObject( taskbar_font );
++    taskbar_font = CreateFontIndirectW( &ncm.lfMessageFont );
+     font = CreateFontIndirectW( &ncm.lfCaptionFont );
+     /* FIXME: Implement BCM_GETIDEALSIZE and use that instead. */
+     SelectObject( hdc, font );
+@@ -1092,9 +1337,38 @@
+     tray_width = GetSystemMetrics( SM_CXSCREEN );
+     tray_height = max( icon_cy, size.cy );
+     start_button_width = size.cx;
++
++    /* roomier flat taskbar, with a search field and a clock */
++    {
++        int unit = GetSystemMetrics( SM_CXSMICON );
++        SIZE text;
++
++        tray_height = max( tray_height, unit * 5 / 2 );
++        hdc = GetDC( 0 );
++        SelectObject( hdc, taskbar_font );
++        GetTextExtentPointW( hdc, start_label, lstrlenW(start_label), &text );
++        start_button_width = text.cx + unit * 3;
++        GetTextExtentPointW( hdc, L"Search programs", 15, &text );
++        search_button_width = text.cx + unit * 2;
++        update_clock( FALSE );
++        GetTextExtentPointW( hdc, clock_date, lstrlenW(clock_date), &text );
++        clock_width = text.cx;
++        GetTextExtentPointW( hdc, L"00:00 PM", 8, &text );
++        clock_width = max( clock_width, text.cx ) + unit * 3 / 2;
++        /* room for the on-screen keyboard key, a square at the end */
++        keyboard_width = is_android_desktop() ? tray_height : 0;
++        clock_width += keyboard_width;
++        ReleaseDC( 0, hdc );
++        if (!search_button)
++            search_button = CreateWindowW( WC_BUTTONW, NULL, WS_CHILD | BS_OWNERDRAW,
++                                           0, 0, 0, 0, tray_window, (HMENU)1, 0, 0 );
++        SetTimer( tray_window, CLOCK_TIMER, 5000, NULL );
++    }
+     SetWindowPos( tray_window, 0, 0, GetSystemMetrics( SM_CYSCREEN ) - tray_height,
+                   tray_width, tray_height, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW );
+     sync_taskbar_buttons();
++    /* the desktop icon columns end above the taskbar */
++    if (is_android_desktop()) InvalidateRect( GetDesktopWindow(), NULL, TRUE );
+ }
+ 
+ static LRESULT WINAPI shell_traywnd_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+@@ -1138,6 +1412,19 @@
+         paint_taskbar_button( (const DRAWITEMSTRUCT *)lparam );
+         break;
+ 
++    case WM_ERASEBKGND:
++        if (!enable_taskbar) return DefWindowProcW( hwnd, msg, wparam, lparam );
++        return 1;
++
++    case WM_PAINT:
++        if (!enable_taskbar) return DefWindowProcW( hwnd, msg, wparam, lparam );
++        paint_taskbar( hwnd );
++        break;
++
++    case WM_TIMER:
++        if (wparam == CLOCK_TIMER) update_clock( TRUE );
++        break;
++
+     case WM_COMMAND:
+         if (HIWORD(wparam) == BN_CLICKED)
+         {
+--- a/programs/explorer/explorer_private.h
++++ b/programs/explorer/explorer_private.h
+@@ -26,6 +26,10 @@
+ extern void initialize_appbar(void);
+ extern void handle_parent_notify( HWND hwnd, WPARAM wp );
+ extern void do_startmenu( HWND owner );
++extern BOOL is_android_desktop(void);
++extern void toggle_search( HWND button );
++extern BOOL is_search_open(void);
++extern void draw_search_glyph( HDC hdc, int x, int y, int size, COLORREF color );
+ extern LRESULT menu_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
+ 
+ #endif  /* __WINE_EXPLORER_PRIVATE_H */
+--- a/programs/explorer/Makefile.in
++++ b/programs/explorer/Makefile.in
+@@ -9,5 +9,6 @@
+ 	desktop.c \
+ 	explorer.c \
+ 	explorer.rc \
++	search.c \
+ 	startmenu.c \
+ 	systray.c
+--- a/programs/explorer/search.c
++++ b/programs/explorer/search.c
+@@ -0,0 +1,677 @@
++/*
++ * Taskbar program search
++ *
++ * Copyright 2026 WineDroid
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#define COBJMACROS
++
++#include <stdlib.h>
++#include <wchar.h>
++#include <wctype.h>
++#include <windows.h>
++#include <shellapi.h>
++#include <shlobj.h>
++#include <shobjidl.h>
++
++#include "wine/debug.h"
++#include "explorer_private.h"
++
++#define SEARCH_BG       RGB(32, 34, 41)
++#define SEARCH_BORDER   RGB(62, 66, 78)
++#define SEARCH_FIELD    RGB(47, 50, 60)
++#define SEARCH_ACCENT   RGB(76, 154, 255)
++#define SEARCH_TEXT     RGB(236, 238, 243)
++#define SEARCH_DIM      RGB(150, 155, 168)
++#define SEARCH_SELECTED RGB(56, 64, 84)
++
++#define ID_EDIT 1
++#define ID_LIST 2
++
++#define RUN_ITEM ((LPARAM)-2)  /* -1 is LB_ERR */
++
++struct search_item
++{
++    WCHAR *name;
++    WCHAR *path;
++    HICON  icon;
++    BOOL   icon_loaded;
++};
++
++static struct search_item *items;
++static unsigned int nb_items, nb_items_allocated;
++
++static HWND search_window, search_edit, search_list;
++static WNDPROC orig_edit_proc, orig_list_proc;
++static HFONT search_font;
++static HBRUSH bg_brush, field_brush;
++static int unit;  /* small icon size, 16 at 96 dpi */
++
++/* programs that come with Wine, so that there is something to find in a new prefix */
++static const struct
++{
++    const WCHAR *name;
++    const WCHAR *exe;
++}
++builtin_programs[] =
++{
++    { L"Wine settings",       L"winecfg.exe" },
++    { L"Command prompt",      L"wineconsole.exe" },
++    { L"Notepad",             L"notepad.exe" },
++    { L"Registry editor",     L"regedit.exe" },
++    { L"Task manager",        L"taskmgr.exe" },
++    { L"File manager",        L"winefile.exe" },
++    { L"Wine explorer",       L"explorer.exe" },
++    { L"Control panel",       L"control.exe" },
++    { L"Uninstall programs",  L"uninstaller.exe" },
++};
++
++void draw_search_glyph( HDC hdc, int x, int y, int size, COLORREF color )
++{
++    int width = max( 1, size / 8 ), d = size * 5 / 8;
++    HPEN pen = SelectObject( hdc, CreatePen( PS_SOLID, width, color ));
++    HBRUSH brush = SelectObject( hdc, GetStockObject( NULL_BRUSH ));
++
++    Ellipse( hdc, x, y, x + d, y + d );
++    MoveToEx( hdc, x + d * 85 / 100, y + d * 85 / 100, NULL );
++    LineTo( hdc, x + size, y + size );
++    SelectObject( hdc, brush );
++    DeleteObject( SelectObject( hdc, pen ));
++}
++
++static void free_items(void)
++{
++    unsigned int i;
++
++    for (i = 0; i < nb_items; i++)
++    {
++        free( items[i].name );
++        free( items[i].path );
++        if (items[i].icon) DestroyIcon( items[i].icon );
++    }
++    nb_items = 0;
++}
++
++static void add_item( const WCHAR *name, int name_len, const WCHAR *path )
++{
++    unsigned int i;
++
++    /* the same program is often in the start menu and on the desktop */
++    for (i = 0; i < nb_items; i++)
++        if (!wcsnicmp( items[i].name, name, name_len ) && !items[i].name[name_len]) return;
++
++    if (nb_items == nb_items_allocated)
++    {
++        unsigned int count = max( 32, nb_items_allocated * 2 );
++        struct search_item *tmp = realloc( items, count * sizeof(*tmp) );
++        if (!tmp) return;
++        items = tmp;
++        nb_items_allocated = count;
++    }
++    items[nb_items].name = malloc( (name_len + 1) * sizeof(WCHAR) );
++    items[nb_items].path = wcsdup( path );
++    if (!items[nb_items].name || !items[nb_items].path)
++    {
++        free( items[nb_items].name );
++        free( items[nb_items].path );
++        return;
++    }
++    memcpy( items[nb_items].name, name, name_len * sizeof(WCHAR) );
++    items[nb_items].name[name_len] = 0;
++    items[nb_items].icon = NULL;
++    items[nb_items].icon_loaded = FALSE;
++    nb_items++;
++}
++
++static void add_folder_items( const WCHAR *folder, int depth )
++{
++    WCHAR path[MAX_PATH];
++    WIN32_FIND_DATAW data;
++    HANDLE handle;
++
++    if (depth > 4 || lstrlenW( folder ) + 3 > MAX_PATH) return;
++    swprintf( path, MAX_PATH, L"%s\\*", folder );
++    if ((handle = FindFirstFileW( path, &data )) == INVALID_HANDLE_VALUE) return;
++    do
++    {
++        const WCHAR *ext;
++        int len = lstrlenW( data.cFileName );
++
++        if (data.cFileName[0] == '.') continue;
++        if (lstrlenW( folder ) + len + 2 > MAX_PATH) continue;
++        swprintf( path, MAX_PATH, L"%s\\%s", folder, data.cFileName );
++        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
++        {
++            add_folder_items( path, depth + 1 );
++            continue;
++        }
++        if (len < 5) continue;
++        ext = data.cFileName + len - 4;
++        if (wcsicmp( ext, L".lnk" ) && wcsicmp( ext, L".url" )) continue;
++        add_item( data.cFileName, len - 4, path );
++    }
++    while (FindNextFileW( handle, &data ));
++    FindClose( handle );
++}
++
++static void load_items(void)
++{
++    static const int folders[] = { CSIDL_PROGRAMS, CSIDL_COMMON_PROGRAMS,
++                                   CSIDL_DESKTOPDIRECTORY, CSIDL_COMMON_DESKTOPDIRECTORY };
++    WCHAR path[MAX_PATH];
++    unsigned int i;
++
++    free_items();
++    CoInitialize( NULL );  /* for the shell links, once per thread */
++    for (i = 0; i < ARRAY_SIZE(folders); i++)
++        if (SUCCEEDED( SHGetFolderPathW( NULL, folders[i], NULL, SHGFP_TYPE_CURRENT, path )))
++            add_folder_items( path, 0 );
++
++    for (i = 0; i < ARRAY_SIZE(builtin_programs); i++)
++        if (SearchPathW( NULL, builtin_programs[i].exe, NULL, MAX_PATH, path, NULL ))
++            add_item( builtin_programs[i].name, lstrlenW( builtin_programs[i].name ), path );
++}
++
++/* the icon a shortcut points to; SHGetFileInfo only gives Wine's generic link icon */
++static HICON get_shortcut_icon( const WCHAR *path )
++{
++    WCHAR tmp[MAX_PATH], file[MAX_PATH];
++    const WCHAR *ext = wcsrchr( path, '.' );
++    IShellLinkW *link;
++    IPersistFile *persist;
++    HICON icon = NULL;
++    int index = 0;
++
++    if (ext && !wcsicmp( ext, L".url" ))
++    {
++        GetPrivateProfileStringW( L"InternetShortcut", L"IconFile", L"", tmp, MAX_PATH, path );
++        index = GetPrivateProfileIntW( L"InternetShortcut", L"IconIndex", 0, path );
++        ExpandEnvironmentStringsW( tmp, file, MAX_PATH );
++        if (file[0]) ExtractIconExW( file, index, &icon, NULL, 1 );
++        return icon;
++    }
++    if (!ext || wcsicmp( ext, L".lnk" ))
++    {
++        ExtractIconExW( path, 0, &icon, NULL, 1 );
++        return icon;
++    }
++
++    if (FAILED( CoCreateInstance( &CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, &IID_IShellLinkW, (void **)&link )))
++        return NULL;
++    if (SUCCEEDED( IShellLinkW_QueryInterface( link, &IID_IPersistFile, (void **)&persist )))
++    {
++        if (SUCCEEDED( IPersistFile_Load( persist, path, 0 )))
++        {
++            tmp[0] = 0;
++            IShellLinkW_GetIconLocation( link, tmp, MAX_PATH, &index );
++            ExpandEnvironmentStringsW( tmp, file, MAX_PATH );
++            if (file[0]) ExtractIconExW( file, index, &icon, NULL, 1 );
++            if (!icon)
++            {
++                tmp[0] = 0;
++                IShellLinkW_GetPath( link, tmp, MAX_PATH, NULL, SLGP_RAWPATH );
++                ExpandEnvironmentStringsW( tmp, file, MAX_PATH );
++                if (file[0]) ExtractIconExW( file, 0, &icon, NULL, 1 );
++            }
++        }
++        IPersistFile_Release( persist );
++    }
++    IShellLinkW_Release( link );
++    return icon;
++}
++
++static HICON get_item_icon( struct search_item *item )
++{
++    SHFILEINFOW info;
++
++    if (!item->icon_loaded)
++    {
++        item->icon_loaded = TRUE;
++        item->icon = get_shortcut_icon( item->path );
++        if (!item->icon && SHGetFileInfoW( item->path, 0, &info, sizeof(info), SHGFI_ICON | SHGFI_LARGEICON ))
++            item->icon = info.hIcon;
++    }
++    return item->icon;
++}
++
++/* 0 for a match at the start of the name, 1 at the start of a word, 2 anywhere, -1 for none */
++static int match_rank( const WCHAR *name, const WCHAR *query, int query_len )
++{
++    const WCHAR *p;
++    int rank = -1;
++
++    if (!query_len) return 0;
++    for (p = name; *p; p++)
++    {
++        if (wcsnicmp( p, query, query_len )) continue;
++        if (p == name) return 0;
++        if (!iswalnum( p[-1] )) rank = 1;
++        else if (rank == -1) rank = 2;
++    }
++    return rank;
++}
++
++static const WCHAR *sort_query;
++static int sort_query_len;
++
++static int __cdecl compare_items( const void *a, const void *b )
++{
++    const struct search_item *item1 = &items[*(const unsigned int *)a];
++    const struct search_item *item2 = &items[*(const unsigned int *)b];
++    int rank1 = match_rank( item1->name, sort_query, sort_query_len );
++    int rank2 = match_rank( item2->name, sort_query, sort_query_len );
++
++    if (rank1 != rank2) return rank1 - rank2;
++    return lstrcmpiW( item1->name, item2->name );
++}
++
++static void update_results(void)
++{
++    WCHAR query[MAX_PATH];
++    unsigned int i, count = 0, *order;
++    int len;
++
++    len = GetWindowTextW( search_edit, query, ARRAY_SIZE(query) );
++    while (len && query[len - 1] == ' ') query[--len] = 0;
++
++    SendMessageW( search_list, WM_SETREDRAW, FALSE, 0 );
++    SendMessageW( search_list, LB_RESETCONTENT, 0, 0 );
++    if ((order = malloc( max( 1, nb_items ) * sizeof(*order) )))
++    {
++        for (i = 0; i < nb_items; i++)
++            if (match_rank( items[i].name, query, len ) >= 0) order[count++] = i;
++        sort_query = query;
++        sort_query_len = len;
++        qsort( order, count, sizeof(*order), compare_items );
++        for (i = 0; i < count; i++) SendMessageW( search_list, LB_ADDSTRING, 0, order[i] );
++        free( order );
++    }
++    if (len) SendMessageW( search_list, LB_ADDSTRING, 0, RUN_ITEM );
++    SendMessageW( search_list, LB_SETCURSEL, 0, 0 );
++    SendMessageW( search_list, WM_SETREDRAW, TRUE, 0 );
++    InvalidateRect( search_list, NULL, TRUE );
++}
++
++static void close_search(void)
++{
++    if (search_window) DestroyWindow( search_window );
++}
++
++static void run_command( WCHAR *command )
++{
++    WCHAR *args = NULL, *p;
++
++    if ((INT_PTR)ShellExecuteW( NULL, NULL, command, NULL, NULL, SW_SHOWNORMAL ) > 32) return;
++
++    /* split off the arguments, allowing a quoted program name */
++    if (command[0] == '"' && (p = wcschr( command + 1, '"' )))
++    {
++        *p = 0;
++        args = p + 1;
++        command++;
++    }
++    else if ((p = wcschr( command, ' ' )))
++    {
++        *p = 0;
++        args = p + 1;
++    }
++    if (args) while (*args == ' ') args++;
++    if ((INT_PTR)ShellExecuteW( NULL, NULL, command, args, NULL, SW_SHOWNORMAL ) <= 32)
++    {
++        WCHAR message[MAX_PATH + 64];
++        swprintf( message, ARRAY_SIZE(message), L"Could not find \"%s\".", command );
++        MessageBoxW( NULL, message, L"Search", MB_OK | MB_ICONERROR );
++    }
++}
++
++static void launch_item( int index )
++{
++    WCHAR command[MAX_PATH];
++    LPARAM data;
++
++    if (index < 0) index = 0;
++    data = SendMessageW( search_list, LB_GETITEMDATA, index, 0 );
++    if (data == LB_ERR) return;
++    if (data == RUN_ITEM)
++    {
++        GetWindowTextW( search_edit, command, ARRAY_SIZE(command) );
++        close_search();
++        run_command( command );
++        return;
++    }
++    lstrcpynW( command, items[data].path, ARRAY_SIZE(command) );
++    close_search();
++    ShellExecuteW( NULL, NULL, command, NULL, NULL, SW_SHOWNORMAL );
++}
++
++static LRESULT WINAPI edit_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
++{
++    switch (msg)
++    {
++    case WM_KEYDOWN:
++    {
++        int sel = SendMessageW( search_list, LB_GETCURSEL, 0, 0 );
++        int count = SendMessageW( search_list, LB_GETCOUNT, 0, 0 );
++
++        switch (wparam)
++        {
++        case VK_DOWN:
++            if (sel + 1 < count) SendMessageW( search_list, LB_SETCURSEL, sel + 1, 0 );
++            return 0;
++        case VK_UP:
++            if (sel > 0) SendMessageW( search_list, LB_SETCURSEL, sel - 1, 0 );
++            return 0;
++        case VK_NEXT:
++            SendMessageW( search_list, LB_SETCURSEL, min( count - 1, sel + 8 ), 0 );
++            return 0;
++        case VK_PRIOR:
++            SendMessageW( search_list, LB_SETCURSEL, max( 0, sel - 8 ), 0 );
++            return 0;
++        case VK_RETURN:
++            launch_item( sel );
++            return 0;
++        case VK_ESCAPE:
++            close_search();
++            return 0;
++        }
++        break;
++    }
++    case WM_CHAR:
++        if (wparam == '\r' || wparam == 27) return 0;  /* no beep */
++        break;
++    case WM_PAINT:
++    {
++        LRESULT ret = CallWindowProcW( orig_edit_proc, hwnd, msg, wparam, lparam );
++
++        if (!GetWindowTextLengthW( hwnd ))
++        {
++            HDC hdc = GetDC( hwnd );
++            RECT rect;
++
++            GetClientRect( hwnd, &rect );
++            rect.left += 2;
++            SelectObject( hdc, search_font );
++            SetBkMode( hdc, TRANSPARENT );
++            SetTextColor( hdc, SEARCH_DIM );
++            DrawTextW( hdc, L"Type to search programs", -1, &rect, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX );
++            ReleaseDC( hwnd, hdc );
++        }
++        return ret;
++    }
++    }
++    return CallWindowProcW( orig_edit_proc, hwnd, msg, wparam, lparam );
++}
++
++static int list_item_from_point( HWND hwnd, LPARAM lparam )
++{
++    DWORD ret = SendMessageW( hwnd, LB_ITEMFROMPOINT, 0, lparam );
++
++    if (HIWORD(ret)) return -1;  /* outside of the items */
++    return LOWORD(ret);
++}
++
++/* the edit control keeps the focus, the list only shows the results */
++static LRESULT WINAPI list_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
++{
++    int index;
++
++    switch (msg)
++    {
++    case WM_MOUSEMOVE:
++        if ((index = list_item_from_point( hwnd, lparam )) >= 0 &&
++            index != SendMessageW( hwnd, LB_GETCURSEL, 0, 0 ))
++            SendMessageW( hwnd, LB_SETCURSEL, index, 0 );
++        return 0;
++    case WM_LBUTTONDOWN:
++    case WM_LBUTTONDBLCLK:
++        if ((index = list_item_from_point( hwnd, lparam )) >= 0)
++            SendMessageW( hwnd, LB_SETCURSEL, index, 0 );
++        return 0;
++    case WM_LBUTTONUP:
++        if ((index = list_item_from_point( hwnd, lparam )) >= 0) launch_item( index );
++        return 0;
++    case WM_SETFOCUS:
++        SetFocus( search_edit );
++        return 0;
++    }
++    return CallWindowProcW( orig_list_proc, hwnd, msg, wparam, lparam );
++}
++
++static void get_field_rect( HWND hwnd, RECT *rect )
++{
++    TEXTMETRICW tm;
++    HDC hdc = GetDC( hwnd );
++
++    SelectObject( hdc, search_font );
++    GetTextMetricsW( hdc, &tm );
++    ReleaseDC( hwnd, hdc );
++    GetClientRect( hwnd, rect );
++    InflateRect( rect, -unit, -unit );
++    rect->bottom = rect->top + tm.tmHeight + unit;
++}
++
++static void layout_search( HWND hwnd )
++{
++    RECT client, field;
++    int glyph = unit;
++
++    GetClientRect( hwnd, &client );
++    get_field_rect( hwnd, &field );
++    SetWindowPos( search_edit, 0, field.left + glyph * 2, field.top + unit / 3,
++                  field.right - field.left - glyph * 2 - unit / 2, field.bottom - field.top - unit * 2 / 3,
++                  SWP_NOZORDER | SWP_NOACTIVATE );
++    SetWindowPos( search_list, 0, unit / 2, field.bottom + unit / 2,
++                  client.right - unit, client.bottom - field.bottom - unit,
++                  SWP_NOZORDER | SWP_NOACTIVATE );
++}
++
++static void paint_search( HWND hwnd )
++{
++    PAINTSTRUCT ps;
++    RECT client, field;
++    HDC hdc = BeginPaint( hwnd, &ps );
++    HPEN pen;
++    HBRUSH brush;
++
++    GetClientRect( hwnd, &client );
++    FillRect( hdc, &client, bg_brush );
++    pen = SelectObject( hdc, CreatePen( PS_SOLID, 1, SEARCH_BORDER ));
++    brush = SelectObject( hdc, GetStockObject( NULL_BRUSH ));
++    Rectangle( hdc, client.left, client.top, client.right, client.bottom );
++
++    get_field_rect( hwnd, &field );
++    SelectObject( hdc, field_brush );
++    RoundRect( hdc, field.left, field.top, field.right, field.bottom, unit / 2, unit / 2 );
++    SelectObject( hdc, brush );
++    DeleteObject( SelectObject( hdc, pen ));
++
++    /* accent line under the search field, like the active taskbar button */
++    SetRect( &client, field.left + unit / 4, field.bottom - max( 2, unit / 8 ), field.right - unit / 4, field.bottom );
++    brush = CreateSolidBrush( SEARCH_ACCENT );
++    FillRect( hdc, &client, brush );
++    DeleteObject( brush );
++
++    draw_search_glyph( hdc, field.left + unit / 2, (field.top + field.bottom - unit * 3 / 4) / 2,
++                       unit * 3 / 4, SEARCH_DIM );
++    EndPaint( hwnd, &ps );
++}
++
++static void draw_item( const DRAWITEMSTRUCT *dis )
++{
++    WCHAR text[MAX_PATH + 16];
++    RECT rect = dis->rcItem;
++    HICON icon = NULL;
++    int icon_size = unit * 3 / 2;
++    HBRUSH brush;
++    HPEN pen;
++
++    FillRect( dis->hDC, &rect, bg_brush );
++    if (dis->itemID == (UINT)-1) return;
++
++    if (dis->itemState & ODS_SELECTED)
++    {
++        brush = SelectObject( dis->hDC, CreateSolidBrush( SEARCH_SELECTED ));
++        pen = SelectObject( dis->hDC, GetStockObject( NULL_PEN ));
++        RoundRect( dis->hDC, rect.left, rect.top + 1, rect.right + 1, rect.bottom, unit / 2, unit / 2 );
++        DeleteObject( SelectObject( dis->hDC, brush ));
++        SelectObject( dis->hDC, pen );
++    }
++
++    if (dis->itemData == RUN_ITEM)
++    {
++        WCHAR query[MAX_PATH];
++
++        GetWindowTextW( search_edit, query, ARRAY_SIZE(query) );
++        swprintf( text, ARRAY_SIZE(text), L"Run \"%s\"", query );
++        draw_search_glyph( dis->hDC, rect.left + unit / 2 + (icon_size - unit) / 2,
++                           (rect.top + rect.bottom - unit) / 2, unit, SEARCH_DIM );
++    }
++    else
++    {
++        lstrcpynW( text, items[dis->itemData].name, ARRAY_SIZE(text) );
++        icon = get_item_icon( &items[dis->itemData] );
++    }
++
++    if (icon) DrawIconEx( dis->hDC, rect.left + unit / 2, (rect.top + rect.bottom - icon_size) / 2,
++                          icon, icon_size, icon_size, 0, 0, DI_NORMAL );
++
++    rect.left += unit + icon_size;
++    rect.right -= unit / 2;
++    SelectObject( dis->hDC, search_font );
++    SetBkMode( dis->hDC, TRANSPARENT );
++    SetTextColor( dis->hDC, dis->itemData == RUN_ITEM ? SEARCH_DIM : SEARCH_TEXT );
++    DrawTextW( dis->hDC, text, -1, &rect, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS );
++}
++
++static LRESULT WINAPI search_wndproc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
++{
++    switch (msg)
++    {
++    case WM_CREATE:
++        search_edit = CreateWindowExW( 0, L"Edit", NULL, WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
++                                       0, 0, 0, 0, hwnd, (HMENU)ID_EDIT, 0, NULL );
++        search_list = CreateWindowExW( 0, L"ListBox", NULL,
++                                       WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_OWNERDRAWFIXED |
++                                       LBS_NOINTEGRALHEIGHT | LBS_NOTIFY,
++                                       0, 0, 0, 0, hwnd, (HMENU)ID_LIST, 0, NULL );
++        SendMessageW( search_edit, WM_SETFONT, (WPARAM)search_font, FALSE );
++        orig_edit_proc = (WNDPROC)SetWindowLongPtrW( search_edit, GWLP_WNDPROC, (LONG_PTR)edit_proc );
++        orig_list_proc = (WNDPROC)SetWindowLongPtrW( search_list, GWLP_WNDPROC, (LONG_PTR)list_proc );
++        layout_search( hwnd );
++        update_results();
++        return 0;
++
++    case WM_SIZE:
++        layout_search( hwnd );
++        return 0;
++
++    case WM_PAINT:
++        paint_search( hwnd );
++        return 0;
++
++    case WM_ERASEBKGND:
++        return 1;
++
++    case WM_MEASUREITEM:
++        ((MEASUREITEMSTRUCT *)lparam)->itemHeight = unit * 5 / 2;
++        return TRUE;
++
++    case WM_DRAWITEM:
++        draw_item( (const DRAWITEMSTRUCT *)lparam );
++        return TRUE;
++
++    case WM_CTLCOLOREDIT:
++        SetTextColor( (HDC)wparam, SEARCH_TEXT );
++        SetBkColor( (HDC)wparam, SEARCH_FIELD );
++        return (LRESULT)field_brush;
++
++    case WM_CTLCOLORLISTBOX:
++        return (LRESULT)bg_brush;
++
++    case WM_COMMAND:
++        if (LOWORD(wparam) == ID_EDIT && HIWORD(wparam) == EN_CHANGE) update_results();
++        return 0;
++
++    case WM_ACTIVATE:
++        if (LOWORD(wparam) == WA_INACTIVE) PostMessageW( hwnd, WM_CLOSE, 0, 0 );
++        else SetFocus( search_edit );
++        return 0;
++
++    case WM_CLOSE:
++        DestroyWindow( hwnd );
++        return 0;
++
++    case WM_DESTROY:
++        search_window = search_edit = search_list = NULL;
++        free_items();
++        return 0;
++    }
++    return DefWindowProcW( hwnd, msg, wparam, lparam );
++}
++
++BOOL is_search_open(void)
++{
++    return search_window != NULL;
++}
++
++/* show the search popup above the taskbar button, or close it if it's open */
++void toggle_search( HWND button )
++{
++    static BOOL registered;
++    NONCLIENTMETRICSW ncm = {sizeof(ncm)};
++    RECT anchor, work;
++    int width, height, x, y;
++
++    if (search_window)
++    {
++        close_search();
++        return;
++    }
++
++    unit = GetSystemMetrics( SM_CYSMICON );
++    if (!registered)
++    {
++        WNDCLASSW class = {0};
++
++        class.lpfnWndProc = search_wndproc;
++        class.hCursor = LoadCursorW( 0, (const WCHAR *)IDC_ARROW );
++        class.lpszClassName = L"__wine_taskbar_search";
++        if (!RegisterClassW( &class )) return;
++        bg_brush = CreateSolidBrush( SEARCH_BG );
++        field_brush = CreateSolidBrush( SEARCH_FIELD );
++        SystemParametersInfoW( SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0 );
++        ncm.lfMessageFont.lfHeight = ncm.lfMessageFont.lfHeight * 6 / 5;
++        search_font = CreateFontIndirectW( &ncm.lfMessageFont );
++        registered = TRUE;
++    }
++
++    load_items();
++
++    GetWindowRect( button, &anchor );
++    SystemParametersInfoW( SPI_GETWORKAREA, 0, &work, 0 );
++    width = min( unit * 28, work.right - work.left );
++    height = min( unit * 30, anchor.top - work.top - unit / 2 );
++    x = max( work.left, min( anchor.left, work.right - width ));
++    y = anchor.top - unit / 4 - height;
++
++    search_window = CreateWindowExW( WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"__wine_taskbar_search", L"Search",
++                                     WS_POPUP | WS_CLIPCHILDREN, x, y, width, height, 0, 0, 0, NULL );
++    if (!search_window) return;
++    ShowWindow( search_window, SW_SHOW );
++    SetForegroundWindow( search_window );
++    SetFocus( search_edit );
++}

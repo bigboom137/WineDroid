@@ -400,6 +400,13 @@ public class WineActivity extends Activity
          * config_changed comes too late for the desktop process */
         load_resolution();
         env.put( "WINEDROID_DPI", Integer.toString( desktop_dpi() ));
+        /* MSYS2 programs (Git Bash) run native programs like git.exe in a nested
+         * pseudo console, whose output Wine's conhost loses */
+        env.put( "MSYS", "disable_pcon" );
+        /* started as a desktop: keep it when the last program exits, the
+         * taskbar and the desktop icons are how programs get started then */
+        if (cmdline != null && cmdline.trim().equalsIgnoreCase( "explorer.exe" ))
+            env.put( "WINEDROID_KEEP_DESKTOP", "1" );
         env.put( "WINEDROID_ROUTES",new File( getFilesDir(), "net/routes" ).toString() );
         env.put( "WINEDROID_DNS", new File( getFilesDir(), "net/dns" ).toString() );
         watchNetwork( getApplicationContext() );
@@ -1427,9 +1434,9 @@ public class WineActivity extends Activity
             if (wallpaper != null) addView( wallpaper );
             addView( desktop_window.create_whole_view() );
             desktop_window.client_group.bringToFront();
-            /* the wallpaper shows instead of the desktop window Wine paints; it
-             * still gets the touches on the desktop, so make it transparent */
-            if (wallpaper != null) desktop_window.window_group.get_content_view().setAlpha( 0 );
+            /* the wallpaper shows through the desktop window: the driver makes
+             * the color explorer paints the empty desktop with transparent, so
+             * only the desktop icons cover it */
 
             message_window = new WineWindow( WineWindow.HWND_MESSAGE, null, 1.0f );
             message_window.create_window_groups();
@@ -1512,6 +1519,7 @@ public class WineActivity extends Activity
             setScaleY( scale );
             desktop_scale = scale;
             setMeasuredDimension( width, height );
+            post( new Runnable() { public void run() { place_keyboard_button(); }} );
         }
 
         @Override
@@ -1527,6 +1535,25 @@ public class WineActivity extends Activity
             // Wine places the windows, only the wallpaper covers the desktop
             if (wallpaper != null) wallpaper.layout( 0, 0, right - left, bottom - top );
         }
+    }
+
+    private View keyboard_button;
+
+    /* the taskbar is 2.5 small icons high, the key is a square at its right end */
+    private void place_keyboard_button()
+    {
+        if (keyboard_button == null || top_view == null) return;
+        int small_icon = Math.round( 16f * desktop_dpi() / 96 );
+        int size = Math.max( 1, Math.round( small_icon * 5 / 2 * desktop_scale ));
+        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams)keyboard_button.getLayoutParams();
+        int right = Math.round( top_view.getTranslationX() ), bottom = Math.round( top_view.getTranslationY() );
+
+        if (params.width == size && params.height == size && params.rightMargin == right && params.bottomMargin == bottom)
+            return;
+        params.width = params.height = size;
+        params.rightMargin = right;
+        params.bottomMargin = bottom;
+        keyboard_button.setLayoutParams( params );
     }
 
     /* Wine's screen size from the launcher setting, 0 to follow the window */
@@ -1950,15 +1977,14 @@ public class WineActivity extends Activity
         root_view = frame;
         frame.setBackgroundColor( 0xff000000 );  /* around a desktop that doesn't fill the window */
         frame.addView( top_view );
-        Button kbd = new Button( this );
-        kbd.setText( "\u2328" );
-        kbd.setAlpha( 0.6f );
-        kbd.setFocusable( false );
-        kbd.setOnClickListener( new View.OnClickListener() {
+        /* explorer draws the keyboard key at the right end of the taskbar,
+         * this invisible view over it gets the taps */
+        keyboard_button = new View( this );
+        keyboard_button.setFocusable( false );
+        keyboard_button.setOnClickListener( new View.OnClickListener() {
             public void onClick( View v ) { toggleSoftKeyboard(); }} );
-        frame.addView( kbd, new FrameLayout.LayoutParams( FrameLayout.LayoutParams.WRAP_CONTENT,
-                                                          FrameLayout.LayoutParams.WRAP_CONTENT,
-                                                          Gravity.BOTTOM | Gravity.END ));
+        frame.addView( keyboard_button, new FrameLayout.LayoutParams( 1, 1, Gravity.BOTTOM | Gravity.END ));
+        place_keyboard_button();
         setContentView( frame );
         top_view.requestFocus();
         progress_dialog.dismiss();

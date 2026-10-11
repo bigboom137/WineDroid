@@ -1,0 +1,41 @@
+From: WineDroid
+Subject: [PATCH] wineandroid.drv: Show the wallpaper through the desktop color key.
+
+Explorer paints the empty parts of the Android desktop in a key color that
+the driver makes transparent, so only the desktop icons cover the wallpaper
+Java shows behind the desktop window.
+---
+--- a/dlls/wineandroid.drv/window.c
++++ b/dlls/wineandroid.drv/window.c
+@@ -693,8 +693,14 @@
+     ANativeWindow        *window;
+     UINT                  clip_count;
+     RECT                 *clip_rects;
++    BOOL                  is_desktop;
+ };
+ 
++/* explorer paints the empty parts of the desktop in this color, so that the
++ * wallpaper Java shows behind the desktop window shows through around the
++ * desktop icons */
++#define DESKTOP_COLOR_KEY RGB( 0x01, 0x02, 0x01 )  /* same in COLORREF and DIB byte order */
++
+ static struct android_window_surface *get_android_surface( struct window_surface *surface )
+ {
+     return (struct android_window_surface *)surface;
+@@ -765,7 +771,7 @@
+     {
+         const RECT *rgn_rect = surface->clip_rects, *end = surface->clip_rects + surface->clip_count;
+         UINT alpha_mask = window_surface->alpha_mask, alpha_bits = window_surface->alpha_bits;
+-        COLORREF color_key = window_surface->color_key;
++        COLORREF color_key = surface->is_desktop ? DESKTOP_COLOR_KEY : window_surface->color_key;
+         BYTE alpha = alpha_bits >> 24;
+         DWORD *src, *dst;
+         int x, y, width;
+@@ -861,6 +867,7 @@
+     {
+         surface = get_android_surface( window_surface );
+         surface->window = get_ioctl_window( hwnd );
++        surface->is_desktop = hwnd == NtUserGetDesktopWindow();
+     }
+ 
+     return window_surface;
