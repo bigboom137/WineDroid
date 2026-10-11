@@ -156,6 +156,8 @@ public class LauncherActivity extends Activity
         runtime_group.setPadding( 0, 0, 0, dp( 16 ));
         root.addView( runtime_group );
 
+        root.addView( mouseSpeedSetting() );
+
         TextView shortcut_title = new TextView( this );
         shortcut_title.setText( "Shortcuts" );
         shortcut_title.setTextSize( TypedValue.COMPLEX_UNIT_SP, 20 );
@@ -203,6 +205,39 @@ public class LauncherActivity extends Activity
         ScrollView scroll = new ScrollView( this );
         scroll.addView( root );
         setContentView( scroll );
+    }
+
+    /* games that hide the cursor get raw mouse motion, which Android's pointer
+     * speed doesn't apply to; games that scale it to a low-resolution playfield
+     * then feel slow on a high-resolution screen */
+    private View mouseSpeedSetting()
+    {
+        final SharedPreferences prefs = getSharedPreferences( PREFS, MODE_PRIVATE );
+        final float[] steps = { 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f, 2.5f, 3.0f, 4.0f };
+        float speed = prefs.getFloat( WineActivity.PREF_MOUSE_SPEED, 1.0f );
+        int pos = 2;
+        for (int i = 0; i < steps.length; i++) if (Math.abs( steps[i] - speed ) < 0.01f) pos = i;
+
+        LinearLayout box = new LinearLayout( this );
+        box.setOrientation( LinearLayout.VERTICAL );
+        box.setPadding( 0, 0, 0, dp( 16 ));
+        final TextView label = new TextView( this );
+        label.setText( "Mouse speed in games that capture the mouse: " + steps[pos] + "×" );
+        box.addView( label );
+        android.widget.SeekBar bar = new android.widget.SeekBar( this );
+        bar.setMax( steps.length - 1 );
+        bar.setProgress( pos );
+        bar.setOnSeekBarChangeListener( new android.widget.SeekBar.OnSeekBarChangeListener() {
+            public void onProgressChanged( android.widget.SeekBar b, int p, boolean user )
+            {
+                label.setText( "Mouse speed in games that capture the mouse: " + steps[p] + "×" );
+                prefs.edit().putFloat( WineActivity.PREF_MOUSE_SPEED, steps[p] ).apply();
+            }
+            public void onStartTrackingTouch( android.widget.SeekBar b ) {}
+            public void onStopTrackingTouch( android.widget.SeekBar b ) {}
+        });
+        box.addView( bar );
+        return box;
     }
 
     private Button button( String label, View.OnClickListener listener )

@@ -116,6 +116,9 @@ public class WineActivity extends Activity
 
     /* Windows command line to run, passed by the launcher */
     public static final String EXTRA_CMDLINE = "org.winehq.wine.CMDLINE";
+    /* launcher setting: factor applied to mouse motion while the pointer is captured */
+    public static final String PREFS_LAUNCHER = "launcher";
+    public static final String PREF_MOUSE_SPEED = "mouse_speed";
     /* Wine build to run, the name of its directory in the assets */
     public static final String EXTRA_RUNTIME = "org.winehq.wine.RUNTIME";
     public static final String RUNTIME_WINE = "wine";
@@ -766,6 +769,7 @@ public class WineActivity extends Activity
         protected WineWindowGroup window_group;
         protected WineWindowGroup client_group;
         protected ImageReader placeholder;
+        protected boolean covered;  /* by a window above it, see update_covered_windows */
 
         public WineWindow( int w, WineWindow parent, float scale )
         {
@@ -790,6 +794,7 @@ public class WineActivity extends Activity
             if (parent != null) parent.children.remove( this );
             destroy_window_groups();
             destroy_placeholder();
+            if (parent == desktop_window) update_covered_windows();
         }
 
         public WineWindowGroup create_window_groups()
@@ -850,6 +855,23 @@ public class WineActivity extends Activity
             client_group.create_view( true ).layout( 0, 0, client_rect.right - client_rect.left,
                                                      client_rect.bottom - client_rect.top );
             if (client_surface == null) set_client_surface( placeholder_surface() );
+            if (get_top_window().covered) client_group.get_content_view().setVisibility( View.INVISIBLE );
+        }
+
+        public WineWindow get_top_window()
+        {
+            WineWindow win = this;
+            while (win.parent != null && win.parent != desktop_window) win = win.parent;
+            return win;
+        }
+
+        /* hide the client views of this window and its children, so they don't
+         * have a surface; programs keep drawing into the placeholder */
+        public void set_covered( boolean covered )
+        {
+            if (client_group != null && client_group.get_content_view() instanceof WineClientView)
+                client_group.get_content_view().setVisibility( covered ? View.INVISIBLE : View.VISIBLE );
+            for (WineWindow child : children) child.set_covered( covered );
         }
 
         protected void add_view_to_parent()
@@ -935,6 +957,7 @@ public class WineActivity extends Activity
                                          client_rect.top - visible_rect.top,
                                          client_rect.right - visible_rect.left,
                                          client_rect.bottom  - visible_rect.top );
+            if (parent == desktop_window) update_covered_windows();
         }
 
         public void set_parent( WineWindow new_parent, float scale )
@@ -1513,10 +1536,12 @@ public class WineActivity extends Activity
     private int captured_buttons;
     private int touchpad_id = -1;
     private float touchpad_x, touchpad_y, captured_dx, captured_dy;
+    private float mouse_speed = 1.0f;
 
     private void update_pointer_capture()
     {
         if (root_view == null) return;
+        mouse_speed = getSharedPreferences( PREFS_LAUNCHER, MODE_PRIVATE ).getFloat( PREF_MOUSE_SPEED, 1.0f );
         if (cursor_hidden && hasWindowFocus())
         {
             if (!root_view.hasPointerCapture())
@@ -1548,11 +1573,11 @@ public class WineActivity extends Activity
         {
             for (int i = 0; i < event.getHistorySize(); i++)
             {
-                captured_dx += event.getHistoricalX( i );
-                captured_dy += event.getHistoricalY( i );
+                captured_dx += event.getHistoricalX( i ) * mouse_speed;
+                captured_dy += event.getHistoricalY( i ) * mouse_speed;
             }
-            captured_dx += event.getX();
-            captured_dy += event.getY();
+            captured_dx += event.getX() * mouse_speed;
+            captured_dy += event.getY() * mouse_speed;
         }
         else if (event.isFromSource( InputDevice.SOURCE_TOUCHPAD ))
         {
@@ -1563,6 +1588,7 @@ public class WineActivity extends Activity
             InputDevice.MotionRange range = event.getDevice() != null ?
                 event.getDevice().getMotionRange( MotionEvent.AXIS_X, event.getSource() ) : null;
             float scale = (range != null && range.getRange() > 0) ? root_view.getWidth() / range.getRange() : 1.0f;
+            scale *= mouse_speed;
 
             if (action == MotionEvent.ACTION_MOVE && id == touchpad_id)
             {
@@ -1599,6 +1625,32 @@ public class WineActivity extends Activity
         if (dx != 0 || dy != 0)
             wine_relative_motion_event( MotionEvent.ACTION_MOVE, dx, dy, captured_buttons, 0, 0 );
         return true;
+    }
+
+    /* SurfaceViews are stacked by the order their surfaces were created in, not by
+     * the order of their views, so the client view of a window behind another one
+     * showed through the hole the front window's own client view punches into the
+     * activity's surface (Steam's browser over a fullscreen game after a resize
+     * recreated it). Windows completely covered by the ones above them don't need
+     * to be shown, so their client views are hidden. */
+    private void update_covered_windows()
+    {
+        if (desktop_window == null) return;
+        android.graphics.Region above = new android.graphics.Region();
+
+        for (WineWindow win : desktop_window.children)  /* top to bottom */
+        {
+            if (!win.visible) continue;
+            android.graphics.Region rest = new android.graphics.Region( win.visible_rect );
+            boolean covered = !rest.op( above, android.graphics.Region.Op.DIFFERENCE );  /* empty */
+            if (covered != win.covered)
+            {
+                Log.i( LOGTAG, String.format( "window %08x %s", win.hwnd, covered ? "covered" : "uncovered" ));
+                win.covered = covered;
+                win.set_covered( covered );
+            }
+            above.op( win.visible_rect, android.graphics.Region.Op.UNION );
+        }
     }
 
     private void toggleSoftKeyboard()
