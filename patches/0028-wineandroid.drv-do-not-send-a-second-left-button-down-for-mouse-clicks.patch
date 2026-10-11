@@ -1,0 +1,24 @@
+Subject: [PATCH] wineandroid.drv: Don't send a second left button down for mouse clicks.
+
+Android delivers a mouse click as ACTION_DOWN and ACTION_BUTTON_PRESS with
+the same button state. The second event added no new button, so it was
+taken for a touch event and sent another left button down, which Wine
+turned into a double click: a single click on a game in Steam's library
+started it (or opened the install dialog).
+
+Only treat ACTION_DOWN without any button pressed as a touch.
+---
+--- a/dlls/wineandroid.drv/window.c
++++ b/dlls/wineandroid.drv/window.c
+@@ -301,7 +301,10 @@
+             data.motion.input.mi.dwFlags |= MOUSEEVENTF_RIGHTDOWN;
+         if ((state & ~prev_state) & AMOTION_EVENT_BUTTON_TERTIARY)
+             data.motion.input.mi.dwFlags |= MOUSEEVENTF_MIDDLEDOWN;
+-        if (!(state & ~prev_state)) /* touch event */
++        /* touch event; a mouse click comes as ACTION_DOWN and ACTION_BUTTON_PRESS with
++         * the same button state, and a second left down for the latter made Wine see a
++         * double click (Steam's library started games on a single click) */
++        if (mask == AMOTION_EVENT_ACTION_DOWN && !(state & 0x7fffffff))
+             data.motion.input.mi.dwFlags |= MOUSEEVENTF_LEFTDOWN;
+         break;
+     case AMOTION_EVENT_ACTION_UP:
