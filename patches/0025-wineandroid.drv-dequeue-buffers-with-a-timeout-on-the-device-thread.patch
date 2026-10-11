@@ -1,0 +1,83 @@
+Subject: [PATCH] wineandroid.drv: Dequeue buffers with a timeout on the device thread.
+
+All window and drawing ioctls of all processes go through the device thread
+of the desktop process. When a SurfaceView never gave a buffer back (seen
+with a Steam popup menu's client surface), the device thread blocked in
+dequeueBuffer forever, and with it explorer's window flushes, every
+CreateWindowEx and the low-level mouse hook chain: all of Steam froze.
+
+Set a dequeue timeout on each Android surface, and let the client retry
+the ioctl, so that other ioctls (and the surface replacement APC) get
+through in between; after 2 seconds, fail the dequeue so that the app
+can recreate its swapchain.
+---
+--- a/dlls/wineandroid.drv/device.c
++++ b/dlls/wineandroid.drv/device.c
+@@ -80,6 +80,11 @@
+     int space[256];
+ };
+ 
++/* how long the device waits for a free buffer at a time, and how long a client
++ * keeps asking before dequeueBuffer fails */
++#define DEQUEUE_TIMEOUT_MS  100
++#define DEQUEUE_MAX_WAIT_MS 2000
++
+ /* data about the native window in the context of the Java process */
+ struct native_win_data
+ {
+@@ -551,6 +556,9 @@
+         win->perform( win, NATIVE_WINDOW_SET_USAGE,
+                       GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN );
+     win->perform( win, NATIVE_WINDOW_SET_BUFFERS_FORMAT, data->buffer_format );
++    /* the device thread serves the windows of all processes, it must not wait
++     * forever for a buffer that may never come back (see dequeueBuffer) */
++    win->perform( win, NATIVE_WINDOW_SET_DEQUEUE_TIMEOUT, (int64_t)DEQUEUE_TIMEOUT_MS * 1000000 );
+     win->setSwapInterval( win, data->swap_interval );
+     unwrap_java_call();
+     NtUserPostMessage( hwnd, WM_ANDROID_REFRESH, opengl, 0 );
+@@ -873,7 +881,8 @@
+         wait_fence_and_close( fence );
+         return STATUS_SUCCESS;
+     }
+-    ERR( "%08x failed %d\n", res->hdr.hwnd, ret );
++    if (ret == -ETIMEDOUT) TRACE( "%08x timed out\n", res->hdr.hwnd );
++    else ERR( "%08x failed %d\n", res->hdr.hwnd, ret );
+     return android_error_to_status( ret );
+ }
+ 
+@@ -1321,14 +1330,28 @@
+     struct native_win_wrapper *win = (struct native_win_wrapper *)window;
+     struct ioctl_android_dequeueBuffer res;
+     DWORD size = sizeof(res);
+-    int ret, use_win32 = !gralloc_module && !gralloc1_device;
++    int ret, tries, use_win32 = !gralloc_module && !gralloc1_device;
+ 
+-    res.hdr.hwnd = HandleToLong( win->hwnd );
+-    res.hdr.opengl = win->opengl;
+-    res.win32 = use_win32;
+-    ret = android_ioctl( IOCTL_DEQUEUE_BUFFER,
+-                         &res, offsetof( struct ioctl_android_dequeueBuffer, native_handle ),
+-                         &res, &size );
++    /* the device dequeues with a timeout, so that a window whose buffers never come
++     * back (a SurfaceView that SurfaceFlinger doesn't consume) can't block the
++     * windows of every other process; wait here instead, but not forever, so that
++     * the app gets an error and can recreate its swapchain */
++    for (tries = 0; ; tries++)
++    {
++        res.hdr.hwnd = HandleToLong( win->hwnd );
++        res.hdr.opengl = win->opengl;
++        res.win32 = use_win32;
++        size = sizeof(res);
++        ret = android_ioctl( IOCTL_DEQUEUE_BUFFER,
++                             &res, offsetof( struct ioctl_android_dequeueBuffer, native_handle ),
++                             &res, &size );
++        if (ret != -ETIMEDOUT) break;
++        if (tries + 1 >= DEQUEUE_MAX_WAIT_MS / DEQUEUE_TIMEOUT_MS)
++        {
++            WARN( "hwnd %p no buffer after %u ms, giving up\n", win->hwnd, DEQUEUE_MAX_WAIT_MS );
++            break;
++        }
++    }
+     if (ret) return ret;
+ 
+     /* if we received the native handle, this is a new buffer */

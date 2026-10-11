@@ -19,7 +19,10 @@ import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.content.pm.ShortcutInfo;
+import android.content.pm.ShortcutManager;
 import android.database.Cursor;
+import android.graphics.drawable.Icon;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -27,6 +30,7 @@ import android.provider.OpenableColumns;
 import android.util.TypedValue;
 import android.view.View;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
@@ -37,6 +41,7 @@ import android.widget.Toast;
 import org.winehq.wine.WineActivity;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.FileOutputStream;
 import java.io.InputStream;
@@ -44,13 +49,18 @@ import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.TreeMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class LauncherActivity extends Activity
 {
     private static final int REQUEST_PICK = 1;
     private static final int REQUEST_PERMS = 2;
+    private static final int REQUEST_PICK_SHORTCUT = 3;
     private static final String PREFS = "launcher";
     private static final String KEY_RECENT = "recent";
+    private static final String KEY_SHORTCUTS = "shortcuts";
     private static final String KEY_RUNTIME = "runtime";
     private static final int MAX_RECENT = 12;
 
@@ -61,6 +71,7 @@ public class LauncherActivity extends Activity
     };
 
     private LinearLayout recent_list;
+    private LinearLayout shortcut_list;
     private RadioGroup runtime_group;
     private String runtime;
 
@@ -98,6 +109,7 @@ public class LauncherActivity extends Activity
     protected void onResume()
     {
         super.onResume();
+        refreshShortcuts();
         refreshRecent();
     }
 
@@ -143,6 +155,24 @@ public class LauncherActivity extends Activity
             public void onCheckedChanged( RadioGroup group, int id ) { selectRuntime( RUNTIMES[id - 1][0] ); }} );
         runtime_group.setPadding( 0, 0, 0, dp( 16 ));
         root.addView( runtime_group );
+
+        TextView shortcut_title = new TextView( this );
+        shortcut_title.setText( "Shortcuts" );
+        shortcut_title.setTextSize( TypedValue.COMPLEX_UNIT_SP, 20 );
+        root.addView( shortcut_title );
+
+        shortcut_list = new LinearLayout( this );
+        shortcut_list.setOrientation( LinearLayout.VERTICAL );
+        root.addView( shortcut_list );
+
+        root.addView( button( "+ Add shortcut…", new View.OnClickListener() {
+            public void onClick( View v ) { addShortcutDialog(); }} ));
+
+        TextView programs_title = new TextView( this );
+        programs_title.setText( "Programs" );
+        programs_title.setTextSize( TypedValue.COMPLEX_UNIT_SP, 20 );
+        programs_title.setPadding( 0, dp( 24 ), 0, dp( 8 ));
+        root.addView( programs_title );
 
         root.addView( button( "Run a Windows program (.exe / .msi)…", new View.OnClickListener() {
             public void onClick( View v ) { pickProgram(); }} ));
@@ -233,6 +263,7 @@ public class LauncherActivity extends Activity
             return;
         }
         saveRuntime( name );
+        refreshShortcuts();
         refreshRecent();
     }
 
@@ -270,7 +301,12 @@ public class LauncherActivity extends Activity
     {
         // "start /unix" accepts a host path and uses the file association, so
         // it handles .exe, .msi, .bat and documents alike.
-        runWine( file.getName(), "start /unix \"" + file.getPath() + "\"", true );
+        runWine( file.getName(), unixCmdline( file ), true );
+    }
+
+    private static String unixCmdline( File file )
+    {
+        return "start /unix \"" + file.getPath() + "\"";
     }
 
     private void stopWine()
@@ -294,8 +330,9 @@ public class LauncherActivity extends Activity
     protected void onActivityResult( int request, int result, Intent data )
     {
         super.onActivityResult( request, result, data );
-        if (request == REQUEST_PICK && result == RESULT_OK && data != null && data.getData() != null)
-            importAndRun( data.getData() );
+        if (result != RESULT_OK || data == null || data.getData() == null) return;
+        if (request == REQUEST_PICK) importAndRun( data.getData(), false );
+        else if (request == REQUEST_PICK_SHORTCUT) importAndRun( data.getData(), true );
     }
 
     private void handleViewIntent( Intent intent )
@@ -304,14 +341,14 @@ public class LauncherActivity extends Activity
             return;
         Uri uri = intent.getData();
         if ("file".equals( uri.getScheme() )) runUnixFile( new File( uri.getPath() ));
-        else importAndRun( uri );
+        else importAndRun( uri, false );
         intent.setAction( null );  // don't run again on recreation
     }
 
     /* Programs picked through the document picker are only reachable through
      * a content URI, so copy them where Wine can see them. Installers are
      * usually a single file, which is the main use case here. */
-    private void importAndRun( final Uri uri )
+    private void importAndRun( final Uri uri, final boolean as_shortcut )
     {
         final String name = displayName( uri );
         final File dir = new File( getFilesDir(), "imports" );
@@ -328,7 +365,11 @@ public class LauncherActivity extends Activity
                 while ((n = in.read( buffer )) > 0) out.write( buffer, 0, n );
                 out.close();
                 in.close();
-                runOnUiThread( new Runnable() { public void run() { runUnixFile( dest ); }} );
+                runOnUiThread( new Runnable() { public void run()
+                {
+                    if (as_shortcut) addShortcut( programLabel( name ), unixCmdline( dest ));
+                    else runUnixFile( dest );
+                }} );
             }
             catch (Exception e)
             {
@@ -414,14 +455,293 @@ public class LauncherActivity extends Activity
             b.setOnLongClickListener( new View.OnLongClickListener() {
                 public boolean onLongClick( View v )
                 {
-                    List<String> l = loadRecent();
-                    l.remove( entry );
-                    saveRecent( l );
-                    refreshRecent();
+                    new AlertDialog.Builder( LauncherActivity.this )
+                        .setTitle( parts[0] )
+                        .setItems( new String[]{ "Add to shortcuts", "Remove from recent" },
+                                   new DialogInterface.OnClickListener() {
+                            public void onClick( DialogInterface d, int which )
+                            {
+                                if (which == 0)
+                                {
+                                    addShortcut( programLabel( parts[0] ), parts[1] );
+                                    return;
+                                }
+                                List<String> l = loadRecent();
+                                l.remove( entry );
+                                saveRecent( l );
+                                refreshRecent();
+                            }} )
+                        .show();
                     return true;
                 }} );
             recent_list.addView( b );
         }
+    }
+
+    // Shortcuts, stored per runtime as "label\tcmdline" lines like the recent list
+
+    private String shortcutKey()
+    {
+        return KEY_SHORTCUTS + "." + runtime;
+    }
+
+    private List<String[]> loadShortcuts()
+    {
+        String s = getSharedPreferences( PREFS, MODE_PRIVATE ).getString( shortcutKey(), "" );
+        List<String[]> list = new ArrayList<String[]>();
+        if (s.length() == 0) return list;
+        for (String line : s.split( "\n" ))
+        {
+            String[] parts = line.split( "\t", 2 );
+            if (parts.length == 2) list.add( parts );
+        }
+        return list;
+    }
+
+    private void saveShortcuts( List<String[]> list )
+    {
+        StringBuilder sb = new StringBuilder();
+        for (String[] e : list)
+        {
+            if (sb.length() > 0) sb.append( '\n' );
+            sb.append( e[0] ).append( '\t' ).append( e[1] );
+        }
+        getSharedPreferences( PREFS, MODE_PRIVATE ).edit().putString( shortcutKey(), sb.toString() ).apply();
+    }
+
+    private void addShortcut( String label, String cmdline )
+    {
+        List<String[]> list = loadShortcuts();
+        for (String[] e : list)
+        {
+            if (e[1].equals( cmdline ))
+            {
+                Toast.makeText( this, e[0] + " is already a shortcut", Toast.LENGTH_SHORT ).show();
+                return;
+            }
+        }
+        list.add( new String[]{ label.replace( '\t', ' ' ).replace( '\n', ' ' ), cmdline } );
+        saveShortcuts( list );
+        refreshShortcuts();
+        Toast.makeText( this, "Added " + label, Toast.LENGTH_SHORT ).show();
+    }
+
+    private void refreshShortcuts()
+    {
+        shortcut_list.removeAllViews();
+        final List<String[]> list = loadShortcuts();
+        if (list.isEmpty())
+        {
+            TextView none = new TextView( this );
+            none.setText( "Add programs and Steam games here to start them with one tap." );
+            shortcut_list.addView( none );
+            return;
+        }
+        for (int i = 0; i < list.size(); i++)
+        {
+            final int index = i;
+            final String[] e = list.get( i );
+            Button b = button( e[0], new View.OnClickListener() {
+                public void onClick( View v ) { runWine( e[0], e[1], false ); }} );
+            b.setOnLongClickListener( new View.OnLongClickListener() {
+                public boolean onLongClick( View v ) { shortcutMenu( index, e ); return true; }} );
+            shortcut_list.addView( b );
+        }
+    }
+
+    private void shortcutMenu( final int index, final String[] entry )
+    {
+        new AlertDialog.Builder( this )
+            .setTitle( entry[0] )
+            .setItems( new String[]{ "Rename", "Add to home screen", "Move up", "Remove" },
+                       new DialogInterface.OnClickListener() {
+                public void onClick( DialogInterface d, int which )
+                {
+                    List<String[]> list = loadShortcuts();
+                    if (index >= list.size()) return;
+                    switch (which)
+                    {
+                    case 0: renameShortcut( index, entry ); return;
+                    case 1: pinShortcut( entry ); return;
+                    case 2:
+                        if (index == 0) return;
+                        list.add( index - 1, list.remove( index ));
+                        break;
+                    case 3:
+                        list.remove( index );
+                        break;
+                    }
+                    saveShortcuts( list );
+                    refreshShortcuts();
+                }} )
+            .show();
+    }
+
+    private void renameShortcut( final int index, final String[] entry )
+    {
+        final EditText edit = new EditText( this );
+        edit.setSingleLine( true );
+        edit.setText( entry[0] );
+        edit.selectAll();
+        new AlertDialog.Builder( this )
+            .setTitle( "Rename shortcut" )
+            .setView( edit )
+            .setPositiveButton( android.R.string.ok, new DialogInterface.OnClickListener() {
+                public void onClick( DialogInterface d, int which )
+                {
+                    String label = edit.getText().toString().trim().replace( '\t', ' ' );
+                    List<String[]> list = loadShortcuts();
+                    if (label.length() == 0 || index >= list.size()) return;
+                    list.get( index )[0] = label;
+                    saveShortcuts( list );
+                    refreshShortcuts();
+                }} )
+            .setNegativeButton( android.R.string.cancel, null )
+            .show();
+    }
+
+    /* the home screen shortcut opens ShortcutActivity, which hands the program
+     * to WineActivity; see there why it doesn't open this launcher */
+    private void pinShortcut( String[] entry )
+    {
+        ShortcutManager sm = getSystemService( ShortcutManager.class );
+        if (sm == null || !sm.isRequestPinShortcutSupported())
+        {
+            Toast.makeText( this, "The home screen doesn't support shortcuts", Toast.LENGTH_SHORT ).show();
+            return;
+        }
+        Intent intent = new Intent( ShortcutActivity.ACTION_RUN );
+        intent.setClass( this, ShortcutActivity.class );
+        intent.putExtra( WineActivity.EXTRA_CMDLINE, entry[1] );
+        intent.putExtra( WineActivity.EXTRA_RUNTIME, runtime );
+        ShortcutInfo info = new ShortcutInfo.Builder( this, runtime + ":" + entry[1] )
+            .setShortLabel( entry[0] )
+            .setIcon( Icon.createWithResource( this, R.drawable.wine ))
+            .setIntent( intent )
+            .build();
+        sm.requestPinShortcut( info, null );
+    }
+
+    /* "Celeste.exe" -> "Celeste" */
+    private static String programLabel( String name )
+    {
+        String lower = name.toLowerCase();
+        for (String ext : new String[]{ ".exe", ".msi", ".bat", ".lnk" })
+            if (lower.endsWith( ext ) && name.length() > ext.length())
+                return name.substring( 0, name.length() - ext.length() );
+        return name;
+    }
+
+    private File prefixDir()
+    {
+        return new File( new File( getFilesDir(), runtime ), "prefix" );
+    }
+
+    /* offer what's installed in this runtime's C: drive: Steam games, Start
+     * menu entries (made by installers) and the recent programs */
+    private void addShortcutDialog()
+    {
+        final List<String[]> found = new ArrayList<String[]>();
+        findSteamGames( found );
+        findStartMenu( found );
+        for (String entry : loadRecent())
+        {
+            String[] parts = entry.split( "\t", 2 );
+            if (parts.length == 2) found.add( new String[]{ programLabel( parts[0] ), parts[1], "Recent" } );
+        }
+
+        final String[] items = new String[found.size() + 1];
+        items[0] = "Choose a file…";
+        for (int i = 0; i < found.size(); i++)
+            items[i + 1] = found.get( i )[0] + "  (" + found.get( i )[2] + ")";
+
+        new AlertDialog.Builder( this )
+            .setTitle( "Add a shortcut for " + runtimeLabel( runtime ))
+            .setItems( items, new DialogInterface.OnClickListener() {
+                public void onClick( DialogInterface d, int which )
+                {
+                    if (which == 0)
+                    {
+                        Intent intent = new Intent( Intent.ACTION_OPEN_DOCUMENT );
+                        intent.addCategory( Intent.CATEGORY_OPENABLE );
+                        intent.setType( "*/*" );
+                        startActivityForResult( intent, REQUEST_PICK_SHORTCUT );
+                        return;
+                    }
+                    String[] e = found.get( which - 1 );
+                    addShortcut( e[0], e[1] );
+                }} )
+            .setNegativeButton( android.R.string.cancel, null )
+            .show();
+    }
+
+    private static final Pattern ACF_APPID = Pattern.compile( "\"appid\"\\s+\"(\\d+)\"" );
+    private static final Pattern ACF_NAME = Pattern.compile( "\"name\"\\s+\"([^\"]*)\"" );
+    private static final String STEAMWORKS_REDIST = "228980";
+
+    /* Steam games are started through steam.exe, which passes them to the
+     * running Steam (or starts it), so the Steam overlay and DRM keep working */
+    private void findSteamGames( List<String[]> found )
+    {
+        File steam = new File( prefixDir(), "drive_c/Program Files (x86)/Steam" );
+        File[] acfs = new File( steam, "steamapps" ).listFiles();
+        if (acfs == null) return;
+        TreeMap<String,String> games = new TreeMap<String,String>( String.CASE_INSENSITIVE_ORDER );
+        for (File acf : acfs)
+        {
+            if (!acf.getName().startsWith( "appmanifest_" ) || !acf.getName().endsWith( ".acf" )) continue;
+            String text = readText( acf );
+            Matcher id = ACF_APPID.matcher( text ), name = ACF_NAME.matcher( text );
+            if (!id.find() || !name.find() || id.group( 1 ).equals( STEAMWORKS_REDIST )) continue;
+            games.put( name.group( 1 ), id.group( 1 ));
+        }
+        String exe = new File( steam, "steam.exe" ).getPath();
+        for (java.util.Map.Entry<String,String> g : games.entrySet())
+            found.add( new String[]{ g.getKey(), "start /unix \"" + exe + "\" -applaunch " + g.getValue(), "Steam" } );
+    }
+
+    private void findStartMenu( List<String[]> found )
+    {
+        TreeMap<String,File> links = new TreeMap<String,File>( String.CASE_INSENSITIVE_ORDER );
+        File drive_c = new File( prefixDir(), "drive_c" );
+        findLinks( new File( drive_c, "ProgramData/Microsoft/Windows/Start Menu/Programs" ), links, 0 );
+        File[] users = new File( drive_c, "users" ).listFiles();
+        if (users != null)
+            for (File user : users)
+                findLinks( new File( user, "AppData/Roaming/Microsoft/Windows/Start Menu/Programs" ), links, 0 );
+        for (java.util.Map.Entry<String,File> l : links.entrySet())
+            found.add( new String[]{ l.getKey(), unixCmdline( l.getValue() ), "Start menu" } );
+    }
+
+    private static void findLinks( File dir, TreeMap<String,File> links, int depth )
+    {
+        File[] files = dir.listFiles();
+        if (files == null || depth > 3) return;
+        for (File f : files)
+        {
+            String name = f.getName();
+            if (f.isDirectory())
+            {
+                if (!name.equals( "StartUp" ) && !name.equals( "Administrative Tools" ))
+                    findLinks( f, links, depth + 1 );
+            }
+            else if (name.toLowerCase().endsWith( ".lnk" ) && !name.toLowerCase().startsWith( "uninstall" ))
+                links.put( programLabel( name ), f );
+        }
+    }
+
+    private static String readText( File file )
+    {
+        try
+        {
+            InputStream in = new FileInputStream( file );
+            byte[] data = new byte[(int)Math.min( file.length(), 1 << 20 )];
+            int len = 0, n;
+            while (len < data.length && (n = in.read( data, len, data.length - len )) > 0) len += n;
+            in.close();
+            return new String( data, 0, len, "UTF-8" );
+        }
+        catch (IOException e) { return ""; }
     }
 
     // Storage access, used for drive D:

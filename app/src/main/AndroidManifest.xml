@@ -37,6 +37,17 @@
             </intent-filter>
         </activity>
 
+        <!-- target of home screen shortcuts, in a task of its own (see ShortcutActivity.java);
+             not exported: home screens start pinned shortcuts as this app, and other
+             apps must not run command lines in Wine -->
+        <activity
+            android:name=".ShortcutActivity"
+            android:exported="false"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
         <!-- singleTask keeps Wine in the launcher's task, so restoring the app from the
              shelf or recents returns to Wine instead of the launcher -->
         <activity

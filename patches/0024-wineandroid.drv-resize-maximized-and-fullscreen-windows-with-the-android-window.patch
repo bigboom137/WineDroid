@@ -1,0 +1,130 @@
+Subject: [PATCH] wineandroid.drv: Resize maximized and fullscreen windows with the Android window.
+
+Resizing the Android window changed the screen size, but Wine windows kept
+their old size, so they were cut off or left an empty area next to them.
+
+After a desktop size change, post a driver message to every visible
+top-level window; in its own thread, a maximized window grows or shrinks by
+the screen size difference and a window covering the whole old screen is
+resized to the new one, in raw pixels so DPI scaling doesn't matter.
+---
+--- a/dlls/wineandroid.drv/android.h
+--- a/dlls/wineandroid.drv/android.h
++++ b/dlls/wineandroid.drv/android.h
+@@ -125,6 +125,7 @@
+ enum android_window_messages
+ {
+     WM_ANDROID_REFRESH = WM_WINE_FIRST_DRIVER_MSG,
++    WM_ANDROID_DESKTOP_CHANGED,
+ };
+ 
+ extern void init_gralloc( const struct hw_module_t *module );
+--- a/dlls/wineandroid.drv/window.c
++++ b/dlls/wineandroid.drv/window.c
+@@ -431,6 +431,77 @@
+ }
+ 
+ /***********************************************************************
++ *           resize_desktop_windows
++ *
++ * The Android window the desktop lives in was resized: let each top-level window
++ * follow it in its own thread (window rects of other processes can't be changed
++ * from here, and their DPI scaling may differ).
++ */
++static void resize_desktop_windows( unsigned int old_width, unsigned int old_height,
++                                    unsigned int new_width, unsigned int new_height )
++{
++    ULONG count = 128;
++    NTSTATUS status;
++    HWND *list;
++    UINT i;
++
++    for (;;)
++    {
++        ULONG size = count;
++
++        if (!(list = malloc( size * sizeof(*list) ))) return;
++        status = NtUserBuildHwndList( 0, 0, 0, 0, 0, size, list, &count );
++        if (!status) break;
++        free( list );
++        if (count <= size) return;  /* failed for another reason than the buffer size */
++    }
++
++    for (i = 0; list[i] != HWND_BOTTOM; i++)
++    {
++        if (!(NtUserGetWindowLongW( list[i], GWL_STYLE ) & WS_VISIBLE)) continue;
++        NtUserPostMessage( list[i], WM_ANDROID_DESKTOP_CHANGED, MAKEWPARAM( old_width, old_height ),
++                           MAKELPARAM( new_width, new_height ));
++    }
++    free( list );
++}
++
++
++/***********************************************************************
++ *           desktop_changed_window
++ *
++ * WM_ANDROID_DESKTOP_CHANGED handler, in the window's thread: a maximized window
++ * grows or shrinks with the screen, a window covering the whole old screen
++ * (a fullscreen game) is resized to the new one. Others keep their size.
++ */
++static void desktop_changed_window( HWND hwnd, unsigned int old_width, unsigned int old_height,
++                                    unsigned int new_width, unsigned int new_height )
++{
++    DWORD style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
++    UINT raw_dpi = NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI );
++    RECT rect;
++
++    if (!(style & WS_VISIBLE) || (style & WS_MINIMIZE)) return;
++    if (!NtUserGetWindowRect( hwnd, &rect, raw_dpi )) return;
++
++    if (style & WS_MAXIMIZE)
++    {
++        /* the work area changes by as much as the screen, the frame stays outside it */
++        rect.right += (int)new_width - (int)old_width;
++        rect.bottom += (int)new_height - (int)old_height;
++    }
++    else if (rect.left == 0 && rect.top == 0 && rect.right == old_width && rect.bottom == old_height)
++    {
++        SetRect( &rect, 0, 0, new_width, new_height );
++    }
++    else return;
++
++    TRACE( "%p %ux%u -> %ux%u, new rect %s\n", hwnd, old_width, old_height,
++           new_width, new_height, wine_dbgstr_rect( &rect ));
++    NtUserSetRawWindowPos( hwnd, rect, SWP_NOZORDER | SWP_NOACTIVATE, FALSE );
++}
++
++
++/***********************************************************************
+  *           process_events
+  */
+ static int process_events( DWORD mask )
+@@ -474,9 +545,15 @@
+         {
+         case DESKTOP_CHANGED:
+             TRACE( "DESKTOP_CHANGED %ux%u\n", event->data.desktop.width, event->data.desktop.height );
+-            screen_width = event->data.desktop.width;
+-            screen_height = event->data.desktop.height;
+-            init_monitors( screen_width, screen_height );
++            {
++                unsigned int old_width = screen_width, old_height = screen_height;
++
++                screen_width = event->data.desktop.width;
++                screen_height = event->data.desktop.height;
++                init_monitors( screen_width, screen_height );
++                if (old_width && old_height && (old_width != screen_width || old_height != screen_height))
++                    resize_desktop_windows( old_width, old_height, screen_width, screen_height );
++            }
+             break;
+ 
+         case CONFIG_CHANGED:
+@@ -1266,6 +1343,9 @@
+             NtUserExposeWindowSurface( hwnd, 0, NULL, 0 );
+         }
+         return 0;
++    case WM_ANDROID_DESKTOP_CHANGED:
++        desktop_changed_window( hwnd, LOWORD(wp), HIWORD(wp), LOWORD(lp), HIWORD(lp) );
++        return 0;
+     default:
+         FIXME( "got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp );
+         return 0;

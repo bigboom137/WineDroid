@@ -1,0 +1,314 @@
+Subject: [PATCH] explorer: Show the taskbar on the Android desktop.
+
+Android runs programs in Wine's root desktop, where explorer never shows its
+taskbar, so there was no way to get back to a window hidden behind another
+one, and no Start menu.
+
+Enable the shell by default on Android (EnableShell=0 in
+HKCU\Software\Wine\Explorer\Desktops\root turns it off) and show the full
+taskbar there; forward WM_DISPLAYCHANGE to it, since only the desktop window
+gets it, and keep it shown then. In wineandroid.drv,
+recompute the work area when the taskbar is shown, hidden or moved, and let
+maximized windows follow work area changes, not only screen size changes.
+
+explorer is a PE file, so the Android checks can't be #ifdef __ANDROID__
+(that also kept the standalone systray from being hidden); check for the
+android graphics driver instead.
+---
+--- a/programs/explorer/desktop.c
++++ b/programs/explorer/desktop.c
+@@ -801,6 +801,13 @@
+     {
+     case WM_DISPLAYCHANGE:
+         display_changed = TRUE;
++        /* on Android only the desktop window is told about the new screen size,
++         * the taskbar has to move to the new bottom of the screen */
++        if (paint_root)
++        {
++            HWND tray = FindWindowW( L"Shell_TrayWnd", NULL );
++            if (tray) PostMessageW( tray, WM_DISPLAYCHANGE, wp, lp );
++        }
+         break;
+     case WM_SYSCOMMAND:
+         switch(wp & 0xfff0)
+@@ -934,6 +941,9 @@
+             found = TRUE;
+         RegCloseKey( hkey );
+     }
++    /* Android programs run full screen in the root desktop, the taskbar is
++     * the only way to switch between their windows */
++    if (!found && paint_root) return TRUE;
+     /* Default off, except for the magic desktop name "shell" */
+     if (!found) result = (lstrcmpiW( name, L"shell" ) == 0);
+     return result;
+@@ -979,11 +989,10 @@
+         RegCloseKey( hkey );
+     }
+ 
+-#ifdef __ANDROID__
+     /* Android has no host systray to dock into, so the standalone systray window
+-     * would float over the top left corner of every program */
+-    if (!found) return FALSE;
+-#endif
++     * would float over the top left corner of every program (explorer is a PE
++     * file, so this can't be an #ifdef __ANDROID__) */
++    if (!found && paint_root) return FALSE;
+     /* Default on */
+     if (!found) result = TRUE;
+     return result;
+@@ -1335,6 +1344,8 @@
+         if (!get_default_desktop_size( name, &width, &height )) width = height = 0;
+     }
+ 
++    /* the Android driver paints the root desktop window itself */
++    paint_root = driver && !wcsicmp( driver, L"android" );
+     enable_shell = name ? get_default_enable_shell( name ) : FALSE;
+     enable_launchers = get_default_enable_launchers();
+     show_systray = get_default_show_systray( name );
+@@ -1348,7 +1359,6 @@
+     {
+         DEVMODEW devmode = {.dmPelsWidth = width, .dmPelsHeight = height};
+         /* magic: desktop "root" means use the root window */
+-        paint_root = driver && !wcsicmp( driver, L"android" );
+         if ((using_root = !wcsicmp( name, L"root" ))) desktop = CreateDesktopW( name, NULL, NULL, DF_WINE_ROOT_DESKTOP, DESKTOP_ALL_ACCESS, NULL );
+         else desktop = CreateDesktopW( name, NULL, &devmode, DF_WINE_VIRTUAL_DESKTOP, DESKTOP_ALL_ACCESS, NULL );
+         if (!desktop)
+@@ -1396,7 +1406,8 @@
+         initialize_display_settings( width, height );
+         initialize_appbar();
+ 
+-        initialize_systray( using_root, enable_shell, show_systray, no_tray_items );
++        /* the Android root desktop has no host taskbar, so it can have Wine's */
++        initialize_systray( using_root && !(paint_root && enable_shell), enable_shell, show_systray, no_tray_items );
+         if (!using_root && enable_launchers) initialize_launchers( hwnd );
+ 
+         if ((shell32 = LoadLibraryW( L"shell32.dll" )) &&
+--- a/programs/explorer/systray.c
++++ b/programs/explorer/systray.c
+@@ -1105,7 +1105,8 @@
+         return handle_incoming((HWND)wparam, (COPYDATASTRUCT *)lparam);
+ 
+     case WM_DISPLAYCHANGE:
+-        if (!show_systray) do_hide_systray();
++        if (enable_taskbar) do_show_systray();
++        else if (!show_systray) do_hide_systray();
+         else if (!nb_displayed && !enable_taskbar) do_hide_systray();
+         else do_show_systray();
+         break;
+--- a/dlls/wineandroid.drv/android.h
++++ b/dlls/wineandroid.drv/android.h
+@@ -131,6 +131,9 @@
+ extern void init_gralloc( const struct hw_module_t *module );
+ extern HWND get_capture_window(void);
+ extern void init_monitors( int width, int height );
++extern HWND get_tray_window(void);
++extern BOOL update_work_area( RECT *old_work );
++extern RECT monitor_rc_work;
+ extern void set_screen_dpi( DWORD dpi );
+ extern void update_keyboard_lock_state( WORD vkey, UINT state );
+ 
+--- a/dlls/wineandroid.drv/init.c
++++ b/dlls/wineandroid.drv/init.c
+@@ -46,7 +46,7 @@
+ 
+ static const unsigned int screen_bpp = 32;  /* we don't support other modes */
+ 
+-static RECT monitor_rc_work;
++RECT monitor_rc_work;
+ static int device_init_done;
+ 
+ PNTAPCFUNC register_window_callback;
+@@ -61,21 +61,25 @@
+ 
+ 
+ /******************************************************************************
+- *           init_monitors
++ *           get_tray_window
+  */
+-void init_monitors( int width, int height )
++HWND get_tray_window(void)
+ {
+     static const WCHAR trayW[] = {'S','h','e','l','l','_','T','r','a','y','W','n','d',0};
+     UNICODE_STRING name;
+-    RECT rect;
+-    HWND hwnd;
+ 
+     RtlInitUnicodeString( &name, trayW );
+-    hwnd = NtUserFindWindowEx( 0, 0, &name, NULL, 0 );
++    return NtUserFindWindowEx( 0, 0, &name, NULL, 0 );
++}
+ 
+-    virtual_screen_rect.right = width;
+-    virtual_screen_rect.bottom = height;
+-    monitor_rc_work = virtual_screen_rect;
++
++/******************************************************************************
++ *           get_work_area
++ */
++static RECT get_work_area( int width, int height )
++{
++    RECT rect, work = {0, 0, width, height};
++    HWND hwnd = get_tray_window();
+ 
+     /* only a taskbar spanning the screen takes space from the work area, not the
+      * standalone systray window, or maximized windows leave a strip next to it */
+@@ -83,11 +87,22 @@
+         NtUserGetWindowRect( hwnd, &rect, NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ) ) &&
+         rect.right - rect.left >= width)
+     {
+-        if (rect.top) monitor_rc_work.bottom = rect.top;
+-        else monitor_rc_work.top = rect.bottom;
+-        TRACE( "found tray %p %s work area %s\n", hwnd,
+-               wine_dbgstr_rect( &rect ), wine_dbgstr_rect( &monitor_rc_work ));
++        if (rect.top > 0) work.bottom = min( work.bottom, rect.top );
++        else work.top = max( work.top, rect.bottom );
++        TRACE( "found tray %p %s work area %s\n", hwnd, wine_dbgstr_rect( &rect ), wine_dbgstr_rect( &work ));
+     }
++    return work;
++}
++
++
++/******************************************************************************
++ *           init_monitors
++ */
++void init_monitors( int width, int height )
++{
++    virtual_screen_rect.right = width;
++    virtual_screen_rect.bottom = height;
++    monitor_rc_work = get_work_area( width, height );
+ 
+     /* if we're notified from Java thread, update registry; this also resizes
+      * the desktop window, which other processes take the screen size from */
+@@ -95,6 +110,23 @@
+ }
+ 
+ 
++/******************************************************************************
++ *           update_work_area
++ *
++ * The taskbar was shown, hidden or moved; returns whether the work area changed.
++ */
++BOOL update_work_area( RECT *old_work )
++{
++    RECT work = get_work_area( screen_width, screen_height );
++
++    if (EqualRect( &work, &monitor_rc_work )) return FALSE;
++    *old_work = monitor_rc_work;
++    monitor_rc_work = work;
++    NtUserCallNoParam( NtUserCallNoParam_DisplayModeChanged );
++    return TRUE;
++}
++
++
+ /* wrapper for NtCreateKey that creates the key recursively if necessary */
+ static HKEY reg_create_key( const WCHAR *name, ULONG name_len )
+ {
+--- a/dlls/wineandroid.drv/window.c
++++ b/dlls/wineandroid.drv/window.c
+@@ -437,9 +437,16 @@
+  * follow it in its own thread (window rects of other processes can't be changed
+  * from here, and their DPI scaling may differ).
+  */
+-static void resize_desktop_windows( unsigned int old_width, unsigned int old_height,
+-                                    unsigned int new_width, unsigned int new_height )
++static void resize_desktop_windows( unsigned int old_width, unsigned int old_height, const RECT *old_work,
++                                    unsigned int new_width, unsigned int new_height, const RECT *new_work )
+ {
++    /* screen sizes and how much each side of the work area moved, 16 bits each */
++    WPARAM wp = (UINT16)old_width | (UINT16)old_height << 16 |
++                (UINT64)(UINT16)(new_work->left - old_work->left) << 32 |
++                (UINT64)(UINT16)(new_work->top - old_work->top) << 48;
++    LPARAM lp = (UINT16)new_width | (UINT16)new_height << 16 |
++                (UINT64)(UINT16)(new_work->right - old_work->right) << 32 |
++                (UINT64)(UINT16)(new_work->bottom - old_work->bottom) << 48;
+     ULONG count = 128;
+     NTSTATUS status;
+     HWND *list;
+@@ -459,8 +466,7 @@
+     for (i = 0; list[i] != HWND_BOTTOM; i++)
+     {
+         if (!(NtUserGetWindowLongW( list[i], GWL_STYLE ) & WS_VISIBLE)) continue;
+-        NtUserPostMessage( list[i], WM_ANDROID_DESKTOP_CHANGED, MAKEWPARAM( old_width, old_height ),
+-                           MAKELPARAM( new_width, new_height ));
++        NtUserPostMessage( list[i], WM_ANDROID_DESKTOP_CHANGED, wp, lp );
+     }
+     free( list );
+ }
+@@ -470,12 +476,13 @@
+  *           desktop_changed_window
+  *
+  * WM_ANDROID_DESKTOP_CHANGED handler, in the window's thread: a maximized window
+- * grows or shrinks with the screen, a window covering the whole old screen
+- * (a fullscreen game) is resized to the new one. Others keep their size.
++ * follows the work area (screen minus taskbar), a window covering the whole old
++ * screen (a fullscreen game) is resized to the new one. Others keep their size.
+  */
+-static void desktop_changed_window( HWND hwnd, unsigned int old_width, unsigned int old_height,
+-                                    unsigned int new_width, unsigned int new_height )
++static void desktop_changed_window( HWND hwnd, WPARAM wp, LPARAM lp )
+ {
++    unsigned int old_width = (UINT16)wp, old_height = (UINT16)(wp >> 16);
++    unsigned int new_width = (UINT16)lp, new_height = (UINT16)(lp >> 16);
+     DWORD style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+     UINT raw_dpi = NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI );
+     RECT rect;
+@@ -485,10 +492,13 @@
+ 
+     if (style & WS_MAXIMIZE)
+     {
+-        /* the work area changes by as much as the screen, the frame stays outside it */
+-        rect.right += (int)new_width - (int)old_width;
+-        rect.bottom += (int)new_height - (int)old_height;
++        /* the frame stays outside the work area */
++        rect.left += (INT16)(wp >> 32);
++        rect.top += (INT16)(wp >> 48);
++        rect.right += (INT16)(lp >> 32);
++        rect.bottom += (INT16)(lp >> 48);
+     }
++    else if (old_width == new_width && old_height == new_height) return;
+     else if (rect.left == 0 && rect.top == 0 && rect.right == old_width && rect.bottom == old_height)
+     {
+         SetRect( &rect, 0, 0, new_width, new_height );
+@@ -547,12 +557,14 @@
+             TRACE( "DESKTOP_CHANGED %ux%u\n", event->data.desktop.width, event->data.desktop.height );
+             {
+                 unsigned int old_width = screen_width, old_height = screen_height;
++                RECT old_work = monitor_rc_work;
+ 
+                 screen_width = event->data.desktop.width;
+                 screen_height = event->data.desktop.height;
+                 init_monitors( screen_width, screen_height );
+                 if (old_width && old_height && (old_width != screen_width || old_height != screen_height))
+-                    resize_desktop_windows( old_width, old_height, screen_width, screen_height );
++                    resize_desktop_windows( old_width, old_height, &old_work,
++                                            screen_width, screen_height, &monitor_rc_work );
+             }
+             break;
+ 
+@@ -1206,6 +1218,17 @@
+     if (!data->parent) owner = NtUserGetWindowRelative( hwnd, GW_OWNER );
+     release_win_data( data );
+ 
++    /* explorer's taskbar was shown, hidden or moved: maximized windows make room for it */
++    if (*p_java_vm && NtUserGetAncestor( hwnd, GA_PARENT ) == NtUserGetDesktopWindow() &&
++        hwnd == get_tray_window())
++    {
++        RECT old_work;
++
++        if (update_work_area( &old_work ))
++            resize_desktop_windows( screen_width, screen_height, &old_work,
++                                    screen_width, screen_height, &monitor_rc_work );
++    }
++
+     if (!(swp_flags & SWP_NOZORDER)) insert_after = NtUserGetWindowRelative( hwnd, GW_HWNDPREV );
+ 
+     TRACE( "win %p new_rects %s style %08x owner %p after %p flags %08x\n", hwnd,
+@@ -1344,7 +1367,7 @@
+         }
+         return 0;
+     case WM_ANDROID_DESKTOP_CHANGED:
+-        desktop_changed_window( hwnd, LOWORD(wp), HIWORD(wp), LOWORD(lp), HIWORD(lp) );
++        desktop_changed_window( hwnd, wp, lp );
+         return 0;
+     default:
+         FIXME( "got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp );

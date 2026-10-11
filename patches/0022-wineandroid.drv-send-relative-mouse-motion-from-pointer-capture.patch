@@ -1,0 +1,97 @@
+Subject: [PATCH] wineandroid.drv: Send relative mouse motion from pointer capture.
+
+The driver only sent absolute positions, so games doing mouselook stopped
+turning once the Android pointer reached the screen edge, and raw input
+reported MOUSE_MOVE_ABSOLUTE with pixel coordinates, which games like
+Godot read as 0-65535 normalized values (very low sensitivity).
+
+Add a JNI entry point for relative motion, which WineActivity uses while
+it holds the Android pointer capture (whenever Wine hides the cursor).
+---
+--- a/dlls/wineandroid.drv/android.h
++++ b/dlls/wineandroid.drv/android.h
+@@ -140,6 +140,8 @@
+                              jboolean client );
+ extern jboolean motion_event( JNIEnv *env, jobject obj, jint win, jint action,
+                               jint x, jint y, jint state, jint vscroll );
++extern jboolean relative_motion_event( JNIEnv *env, jobject obj, jint action,
++                                       jint dx, jint dy, jint state, jint vscroll );
+ extern jboolean keyboard_event( JNIEnv *env, jobject obj, jint win, jint action,
+                                 jint keycode, jint state );
+ 
+--- a/dlls/wineandroid.drv/init.c
++++ b/dlls/wineandroid.drv/init.c
+@@ -342,6 +342,7 @@
+     { "wine_config_changed", "(I)V", config_changed },
+     { "wine_surface_changed", "(ILandroid/view/Surface;Z)V", surface_changed },
+     { "wine_motion_event", "(IIIIII)Z", motion_event },
++    { "wine_relative_motion_event", "(IIIII)Z", relative_motion_event },
+     { "wine_keyboard_event", "(IIII)Z", keyboard_event },
+ };
+ 
+--- a/dlls/wineandroid.drv/window.c
++++ b/dlls/wineandroid.drv/window.c
+@@ -257,12 +257,7 @@
+ }
+ 
+ 
+-/***********************************************************************
+- *           motion_event
+- *
+- * JNI callback, runs in the context of the Java thread.
+- */
+-jboolean motion_event( JNIEnv *env, jobject obj, jint win, jint action, jint x, jint y, jint state, jint vscroll )
++static jboolean send_motion_event( HWND hwnd, int action, int x, int y, int state, int vscroll, BOOL relative )
+ {
+     static LONG button_state;
+     union event_data data;
+@@ -286,14 +281,15 @@
+     prev_state = InterlockedExchange( &button_state, state );
+ 
+     data.type = MOTION_EVENT;
+-    data.motion.hwnd = LongToHandle( win );
++    data.motion.hwnd = hwnd;
+     data.motion.input.type           = INPUT_MOUSE;
+     data.motion.input.mi.dx          = x;
+     data.motion.input.mi.dy          = y;
+     data.motion.input.mi.mouseData   = 0;
+     data.motion.input.mi.time        = 0;
+     data.motion.input.mi.dwExtraInfo = 0;
+-    data.motion.input.mi.dwFlags     = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
++    data.motion.input.mi.dwFlags     = MOUSEEVENTF_MOVE;
++    if (!relative) data.motion.input.mi.dwFlags |= MOUSEEVENTF_ABSOLUTE;
+     switch (action & AMOTION_EVENT_ACTION_MASK)
+     {
+     case AMOTION_EVENT_ACTION_DOWN:
+@@ -334,6 +330,31 @@
+ }
+ 
+ 
++/***********************************************************************
++ *           motion_event
++ *
++ * JNI callback, runs in the context of the Java thread.
++ */
++jboolean motion_event( JNIEnv *env, jobject obj, jint win, jint action, jint x, jint y, jint state, jint vscroll )
++{
++    return send_motion_event( LongToHandle( win ), action, x, y, state, vscroll, FALSE );
++}
++
++
++/***********************************************************************
++ *           relative_motion_event
++ *
++ * JNI callback for mouse motion while Java holds the pointer capture,
++ * which happens while the cursor is hidden. The motion is relative, so
++ * mouselook keeps working at the screen edges and raw input gets deltas.
++ * Runs in the context of the Java thread.
++ */
++jboolean relative_motion_event( JNIEnv *env, jobject obj, jint action, jint dx, jint dy, jint state, jint vscroll )
++{
++    return send_motion_event( 0, action, dx, dy, state, vscroll, TRUE );
++}
++
++
+ /***********************************************************************
+  *           init_event_queue
+  */

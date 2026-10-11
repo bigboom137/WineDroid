@@ -81,7 +81,10 @@ public class WineActivity extends Activity
     public native void wine_desktop_changed( int width, int height );
     public native void wine_config_changed( int dpi );
     public native void wine_surface_changed( int hwnd, Surface surface, boolean opengl );
-    public native boolean wine_motion_event( int hwnd, int action, int x, int y, int state, int vscroll );
+    public native boolean wine_motion_event( int hwnd, int action, int x, int y, int state,
+                                             int vscroll, int hscroll );
+    public native boolean wine_relative_motion_event( int action, int dx, int dy, int state,
+                                                      int vscroll, int hscroll );
     public native boolean wine_keyboard_event( int hwnd, int action, int keycode, int state );
 
     private final String LOGTAG = "wine";
@@ -90,6 +93,7 @@ public class WineActivity extends Activity
     protected WineWindow desktop_window;
     protected WineWindow message_window;
     private PointerIcon current_cursor;
+    private boolean cursor_hidden;
 
     @Override
     public void onCreate(Bundle savedInstanceState)
@@ -1035,8 +1039,13 @@ public class WineActivity extends Activity
 
         public void get_event_pos( MotionEvent event, int[] pos )
         {
-            pos[0] = Math.round( event.getX() * scale + window_group.getLeft() );
-            pos[1] = Math.round( event.getY() * scale + window_group.getTop() );
+            get_event_pos( event, 0, pos );
+        }
+
+        public void get_event_pos( MotionEvent event, int index, int[] pos )
+        {
+            pos[0] = Math.round( event.getX( index ) * scale + window_group.getLeft() );
+            pos[1] = Math.round( event.getY( index ) * scale + window_group.getTop() );
         }
     }
 
@@ -1237,8 +1246,12 @@ public class WineActivity extends Activity
                 Log.i( LOGTAG, String.format( "view motion event win %08x action %d pos %d,%d buttons %04x view %d,%d",
                                               window.hwnd, event.getAction(), pos[0], pos[1],
                                               event.getButtonState(), getLeft(), getTop() ));
+                if (event.getActionMasked() == MotionEvent.ACTION_SCROLL)
+                    return wheel_event( window.hwnd, pos[0], pos[1], event.getButtonState(),
+                                        event.getAxisValue( MotionEvent.AXIS_VSCROLL ),
+                                        event.getAxisValue( MotionEvent.AXIS_HSCROLL ), false );
                 return wine_motion_event( window.hwnd, event.getAction(), pos[0], pos[1],
-                                          event.getButtonState(), (int)event.getAxisValue(MotionEvent.AXIS_VSCROLL)  );
+                                          event.getButtonState(), 0, 0 );
             }
             return super.onGenericMotionEvent(event);
         }
@@ -1249,13 +1262,17 @@ public class WineActivity extends Activity
             if (is_client) return false;  // let the whole window handle it
             if (window.parent != null && window.parent != desktop_window) return false;  // let the parent handle it
 
+            if (touchpad_gesture( window, event )) return true;
+            if (event.getToolType( event.getActionIndex() ) == MotionEvent.TOOL_TYPE_FINGER)
+                return finger_event( window, event );
+
             int[] pos = new int[2];
             window.get_event_pos( event, pos );
             Log.i( LOGTAG, String.format( "view touch event win %08x action %d pos %d,%d buttons %04x view %d,%d",
                                           window.hwnd, event.getAction(), pos[0], pos[1],
                                           event.getButtonState(), getLeft(), getTop() ));
             return wine_motion_event( window.hwnd, event.getAction(), pos[0], pos[1],
-                                      event.getButtonState(), 0 );
+                                      event.getButtonState(), 0, 0 );
         }
 
         @Override
@@ -1352,6 +1369,237 @@ public class WineActivity extends Activity
     }
 
     private TopView top_view;
+    private View root_view;
+
+    // Mouse wheel: Android reports notches as floats (fractions with high
+    // resolution wheels and touchpads), Wine takes WHEEL_DELTA (120) units
+
+    private static final int WHEEL_DELTA = 120;
+    private float wheel_v, wheel_h;  // fractions of WHEEL_DELTA not sent yet
+
+    /* v and h are in notches, positive scrolls up / right */
+    private boolean wheel_event( int hwnd, int x, int y, int state, float v, float h, boolean relative )
+    {
+        wheel_v += v * WHEEL_DELTA;
+        wheel_h += h * WHEEL_DELTA;
+        int dv = (int)wheel_v, dh = (int)wheel_h;
+        wheel_v -= dv;
+        wheel_h -= dh;
+        if (dv == 0 && dh == 0) return true;
+        if (relative) return wine_relative_motion_event( MotionEvent.ACTION_SCROLL, 0, 0, state, dv, dh );
+        return wine_motion_event( hwnd, MotionEvent.ACTION_SCROLL, x, y, state, dv, dh );
+    }
+
+    // Touchpad gestures: Android 14+ hands them to apps as fake fingers that
+    // move from the cursor position. A two-finger scroll would be a left-button
+    // drag, so turn the fingers' movement into wheel events at the cursor;
+    // three-finger swipes and pinches are for the system, drop them.
+
+    private static final float SCROLL_DP_PER_NOTCH = 40.0f;
+    private int swipe_id = -1;
+    private float swipe_x, swipe_y;
+    private int[] swipe_pos = new int[2];
+
+    private boolean touchpad_gesture( WineWindow window, MotionEvent event )
+    {
+        if (Build.VERSION.SDK_INT < 34) return false;
+        int classification = event.getClassification();
+        if (classification == 4 /* MULTI_FINGER_SWIPE, hidden */ || classification == 5 /* PINCH, API 35 */)
+            return true;
+        if (classification != MotionEvent.CLASSIFICATION_TWO_FINGER_SWIPE) return false;
+
+        int action = event.getActionMasked();
+        int index = swipe_id == -1 ? -1 : event.findPointerIndex( swipe_id );
+        if (action == MotionEvent.ACTION_DOWN || index < 0)
+        {
+            /* the fingers start at the cursor, scroll there */
+            swipe_id = event.getPointerId( 0 );
+            swipe_x = event.getX( 0 );
+            swipe_y = event.getY( 0 );
+            window.get_event_pos( event, 0, swipe_pos );
+            Log.i( LOGTAG, String.format( "touchpad scroll win %08x pos %d,%d", window.hwnd, swipe_pos[0], swipe_pos[1] ));
+            return true;
+        }
+        if (action == MotionEvent.ACTION_MOVE)
+        {
+            float x = event.getX( index ), y = event.getY( index );
+            float notch = SCROLL_DP_PER_NOTCH * getResources().getDisplayMetrics().density;
+            /* like dragging content on a touchscreen: fingers down scroll up */
+            wheel_event( window.hwnd, swipe_pos[0], swipe_pos[1], 0,
+                         (y - swipe_y) / notch, (swipe_x - x) / notch, false );
+            swipe_x = x;
+            swipe_y = y;
+        }
+        if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL)
+        {
+            swipe_id = -1;
+            wheel_v = wheel_h = 0;
+        }
+        return true;
+    }
+
+    // Fingers act as mouse buttons: the first one down is the left button, a
+    // second one down at the same time the right button, and the cursor follows
+    // the newest. Clicks happen on touch, and alternating fingers in games (two
+    // keys in rhythm games) each register; further fingers are ignored.
+
+    private int left_finger = -1, right_finger = -1, cursor_finger = -1;
+    private int finger_buttons;
+    private WineWindow cursor_finger_window;
+
+    private boolean finger_event( WineWindow window, MotionEvent event )
+    {
+        int action = event.getActionMasked();
+        int index = event.getActionIndex();
+        int id = event.getPointerId( index );
+        int[] pos = new int[2];
+
+        switch (action)
+        {
+        case MotionEvent.ACTION_DOWN:
+        case MotionEvent.ACTION_POINTER_DOWN:
+            int button;
+            if (left_finger == -1) { left_finger = id; button = MotionEvent.BUTTON_PRIMARY; }
+            else if (right_finger == -1) { right_finger = id; button = MotionEvent.BUTTON_SECONDARY; }
+            else return true;
+            cursor_finger = id;
+            cursor_finger_window = window;
+            finger_buttons |= button;
+            window.get_event_pos( event, index, pos );
+            return wine_motion_event( window.hwnd, MotionEvent.ACTION_BUTTON_PRESS, pos[0], pos[1], finger_buttons, 0, 0 );
+
+        case MotionEvent.ACTION_MOVE:
+            if (window != cursor_finger_window) return true;
+            index = event.findPointerIndex( cursor_finger );
+            if (index < 0) return true;
+            window.get_event_pos( event, index, pos );
+            return wine_motion_event( window.hwnd, MotionEvent.ACTION_MOVE, pos[0], pos[1], finger_buttons, 0, 0 );
+
+        case MotionEvent.ACTION_UP:
+        case MotionEvent.ACTION_POINTER_UP:
+        case MotionEvent.ACTION_CANCEL:
+            int released = 0;
+            if (action == MotionEvent.ACTION_CANCEL)
+            {
+                released = finger_buttons;
+                left_finger = right_finger = -1;
+            }
+            else if (id == left_finger) { left_finger = -1; released = MotionEvent.BUTTON_PRIMARY; }
+            else if (id == right_finger) { right_finger = -1; released = MotionEvent.BUTTON_SECONDARY; }
+            if (released == 0) return true;
+            finger_buttons &= ~released;
+            if (id == cursor_finger || action == MotionEvent.ACTION_CANCEL)
+            {
+                /* release where the finger was lifted, then follow the remaining one */
+                window.get_event_pos( event, index, pos );
+                cursor_finger = left_finger != -1 ? left_finger : right_finger;
+                if (cursor_finger == -1) cursor_finger_window = null;
+            }
+            else
+            {
+                /* release where the cursor is, the other finger keeps it */
+                int i = event.findPointerIndex( cursor_finger );
+                window.get_event_pos( event, i >= 0 ? i : index, pos );
+            }
+            return wine_motion_event( window.hwnd, MotionEvent.ACTION_BUTTON_RELEASE, pos[0], pos[1], finger_buttons, 0, 0 );
+        }
+        return true;
+    }
+
+    // Pointer capture: while Wine hides the cursor (games doing mouselook), take
+    // the pointer from Android and send relative motion. Absolute positions stop
+    // at the screen edge and make raw input report absolute coordinates.
+
+    private int captured_buttons;
+    private int touchpad_id = -1;
+    private float touchpad_x, touchpad_y, captured_dx, captured_dy;
+
+    private void update_pointer_capture()
+    {
+        if (root_view == null) return;
+        if (cursor_hidden && hasWindowFocus())
+        {
+            if (!root_view.hasPointerCapture())
+            {
+                Log.i( LOGTAG, "requesting pointer capture" );
+                root_view.requestPointerCapture();
+            }
+        }
+        else if (root_view.hasPointerCapture())
+        {
+            Log.i( LOGTAG, "releasing pointer capture" );
+            root_view.releasePointerCapture();
+        }
+    }
+
+    @Override
+    public void onWindowFocusChanged( boolean has_focus )
+    {
+        super.onWindowFocusChanged( has_focus );
+        update_pointer_capture();  // Android drops the capture when the window loses focus
+    }
+
+    private boolean captured_pointer_event( MotionEvent event )
+    {
+        int action = event.getActionMasked();
+        int buttons = event.getButtonState();
+
+        if (event.isFromSource( InputDevice.SOURCE_MOUSE_RELATIVE ))
+        {
+            for (int i = 0; i < event.getHistorySize(); i++)
+            {
+                captured_dx += event.getHistoricalX( i );
+                captured_dy += event.getHistoricalY( i );
+            }
+            captured_dx += event.getX();
+            captured_dy += event.getY();
+        }
+        else if (event.isFromSource( InputDevice.SOURCE_TOUCHPAD ))
+        {
+            // captured touchpad events report finger positions on the pad,
+            // follow the first finger and scale the pad's width to the screen's
+            int id = event.getPointerId( 0 );
+            float x = event.getX( 0 ), y = event.getY( 0 );
+            InputDevice.MotionRange range = event.getDevice() != null ?
+                event.getDevice().getMotionRange( MotionEvent.AXIS_X, event.getSource() ) : null;
+            float scale = (range != null && range.getRange() > 0) ? root_view.getWidth() / range.getRange() : 1.0f;
+
+            if (action == MotionEvent.ACTION_MOVE && id == touchpad_id)
+            {
+                captured_dx += (x - touchpad_x) * scale;
+                captured_dy += (y - touchpad_y) * scale;
+            }
+            touchpad_id = (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) ? -1 : id;
+            touchpad_x = x;
+            touchpad_y = y;
+        }
+        else return false;
+
+        int dx = (int)captured_dx, dy = (int)captured_dy;
+        captured_dx -= dx;
+        captured_dy -= dy;
+
+        switch (action)
+        {
+        case MotionEvent.ACTION_BUTTON_PRESS:
+        case MotionEvent.ACTION_BUTTON_RELEASE:
+            if (buttons == captured_buttons) break;
+            if (dx != 0 || dy != 0)
+                wine_relative_motion_event( MotionEvent.ACTION_MOVE, dx, dy, captured_buttons, 0, 0 );
+            captured_buttons = buttons;
+            return wine_relative_motion_event( action, 0, 0, buttons, 0, 0 );
+        case MotionEvent.ACTION_SCROLL:
+            if (dx != 0 || dy != 0)
+                wine_relative_motion_event( MotionEvent.ACTION_MOVE, dx, dy, captured_buttons, 0, 0 );
+            return wheel_event( 0, 0, 0, captured_buttons, event.getAxisValue( MotionEvent.AXIS_VSCROLL ),
+                                event.getAxisValue( MotionEvent.AXIS_HSCROLL ), true );
+        }
+        // the button state only changes through BUTTON_PRESS/RELEASE, so the
+        // driver doesn't mistake those for touch events
+        if (dx != 0 || dy != 0)
+            wine_relative_motion_event( MotionEvent.ACTION_MOVE, dx, dy, captured_buttons, 0, 0 );
+        return true;
+    }
 
     private void toggleSoftKeyboard()
     {
@@ -1372,7 +1620,14 @@ public class WineActivity extends Activity
     {
         Log.i( LOGTAG, String.format( "create desktop view %08x", hwnd ));
         top_view = new TopView( this, hwnd );
-        FrameLayout frame = new FrameLayout( this );
+        FrameLayout frame = new FrameLayout( this ) {
+            @Override
+            public boolean dispatchCapturedPointerEvent( MotionEvent event )
+            {
+                return captured_pointer_event( event );
+            }
+        };
+        root_view = frame;
         frame.addView( top_view );
         Button kbd = new Button( this );
         kbd.setText( "\u2328" );
@@ -1431,6 +1686,8 @@ public class WineActivity extends Activity
             current_cursor = PointerIcon.create( bitmap, hotspotx, hotspoty );
         }
         else current_cursor = PointerIcon.getSystemIcon( this, id );
+        cursor_hidden = (bits == null && id == PointerIcon.TYPE_NULL);
+        update_pointer_capture();
     }
 
     public void window_pos_changed( int hwnd, int flags, int insert_after, int owner, int style,
