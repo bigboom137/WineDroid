@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- dark navy launcher, like WinNative -->
+    <style name="LauncherTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/launcher_background</item>
+        <item name="android:colorBackground">@color/launcher_background</item>
+        <item name="android:statusBarColor">@color/launcher_background</item>
+        <item name="android:navigationBarColor">@color/launcher_background</item>
+        <item name="android:colorAccent">@color/launcher_accent</item>
+        <item name="android:colorPrimary">@color/launcher_surface</item>
+        <item name="android:alertDialogTheme">@style/LauncherDialog</item>
+    </style>
+
+    <style name="LauncherDialog" parent="@android:style/Theme.Material.Dialog.Alert">
+        <item name="android:colorBackground">@color/launcher_surface</item>
+        <item name="android:colorAccent">@color/launcher_accent</item>
+    </style>
+</resources>

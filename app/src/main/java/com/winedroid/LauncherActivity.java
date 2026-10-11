@@ -22,18 +22,22 @@ import android.content.pm.PackageManager;
 import android.content.pm.ShortcutInfo;
 import android.content.pm.ShortcutManager;
 import android.database.Cursor;
+import android.content.res.ColorStateList;
+import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.Icon;
+import android.text.TextUtils;
+import android.view.Gravity;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.OpenableColumns;
-import android.util.TypedValue;
 import android.view.View;
-import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
+import android.widget.ImageView;
+import android.widget.SeekBar;
 import android.widget.LinearLayout;
-import android.widget.RadioButton;
-import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -63,6 +67,7 @@ public class LauncherActivity extends Activity
     private static final String KEY_SHORTCUTS = "shortcuts";
     private static final String KEY_RUNTIME = "runtime";
     private static final int MAX_RECENT = 12;
+    private static final int MAX_RECENT_SHOWN = 5;
 
     /* runtimes the APK can carry: asset directory and name shown */
     private static final String[][] RUNTIMES = {
@@ -70,9 +75,13 @@ public class LauncherActivity extends Activity
         { WineActivity.RUNTIME_PROTON, "Proton 11.0" },
     };
 
+    private static final String KEY_LAST_PLAYED = "last_played";
+
     private LinearLayout recent_list;
-    private LinearLayout shortcut_list;
-    private RadioGroup runtime_group;
+    private LinearLayout hero_box;
+    private Ui.Grid library_grid;
+    private LinearLayout runtime_pills;
+    private TextView running_pill;
     private String runtime;
 
     @Override
@@ -109,102 +118,133 @@ public class LauncherActivity extends Activity
     protected void onResume()
     {
         super.onResume();
-        refreshShortcuts();
+        refreshLibrary();
         refreshRecent();
+        updateRunning();
     }
 
     private void buildUi()
     {
-        int pad = dp( 16 );
+        int pad = dp( 24 );
         LinearLayout root = new LinearLayout( this );
         root.setOrientation( LinearLayout.VERTICAL );
-        root.setPadding( pad, pad, pad, pad );
+        root.setPadding( pad, dp( 20 ), pad, pad );
 
-        TextView title = new TextView( this );
-        title.setText( "WineDroid" );
-        title.setTextSize( TypedValue.COMPLEX_UNIT_SP, 28 );
-        root.addView( title );
+        root.addView( topBar() );
 
-        TextView sub = new TextView( this );
-        sub.setText( "Windows programs running natively on x86_64. The first start of each "
-                     + "runtime unpacks it and sets up its Windows environment, which takes a "
-                     + "few minutes." );
-        sub.setPadding( 0, dp( 4 ), 0, dp( 16 ));
-        root.addView( sub );
+        hero_box = new LinearLayout( this );
+        hero_box.setOrientation( LinearLayout.VERTICAL );
+        root.addView( hero_box );
 
-        TextView runtime_title = new TextView( this );
-        runtime_title.setText( "Runtime" );
-        runtime_title.setTextSize( TypedValue.COMPLEX_UNIT_SP, 20 );
-        root.addView( runtime_title );
-
-        /* each runtime has its own C: drive, so programs installed with one
-         * are not visible to the other */
-        runtime_group = new RadioGroup( this );
-        runtime_group.setOrientation( RadioGroup.HORIZONTAL );
-        for (int i = 0; i < RUNTIMES.length; i++)
-        {
-            if (!hasRuntime( RUNTIMES[i][0] )) continue;
-            RadioButton rb = new RadioButton( this );
-            rb.setId( i + 1 );
-            rb.setText( RUNTIMES[i][1] );
-            rb.setPadding( 0, 0, dp( 16 ), 0 );
-            runtime_group.addView( rb );
-            if (RUNTIMES[i][0].equals( runtime )) rb.setChecked( true );
-        }
-        runtime_group.setOnCheckedChangeListener( new RadioGroup.OnCheckedChangeListener() {
-            public void onCheckedChanged( RadioGroup group, int id ) { selectRuntime( RUNTIMES[id - 1][0] ); }} );
-        runtime_group.setPadding( 0, 0, 0, dp( 16 ));
-        root.addView( runtime_group );
-
-        root.addView( mouseSpeedSetting() );
-
-        TextView shortcut_title = new TextView( this );
-        shortcut_title.setText( "Shortcuts" );
-        shortcut_title.setTextSize( TypedValue.COMPLEX_UNIT_SP, 20 );
-        root.addView( shortcut_title );
-
-        shortcut_list = new LinearLayout( this );
-        shortcut_list.setOrientation( LinearLayout.VERTICAL );
-        root.addView( shortcut_list );
-
-        root.addView( button( "+ Add shortcut…", new View.OnClickListener() {
+        LinearLayout lib_header = new LinearLayout( this );
+        lib_header.setGravity( Gravity.CENTER_VERTICAL );
+        lib_header.setPadding( 0, dp( 20 ), 0, dp( 10 ));
+        TextView lib_title = Ui.section( this, "Library" );
+        lib_title.setPadding( 0, 0, 0, 0 );
+        lib_header.addView( lib_title, new LinearLayout.LayoutParams( 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1 ));
+        lib_header.addView( Ui.pill( this, "+ Add", false, new View.OnClickListener() {
             public void onClick( View v ) { addShortcutDialog(); }} ));
+        root.addView( lib_header );
 
-        TextView programs_title = new TextView( this );
-        programs_title.setText( "Programs" );
-        programs_title.setTextSize( TypedValue.COMPLEX_UNIT_SP, 20 );
-        programs_title.setPadding( 0, dp( 24 ), 0, dp( 8 ));
-        root.addView( programs_title );
+        library_grid = new Ui.Grid( this, 230, 14 );
+        root.addView( library_grid );
 
-        root.addView( button( "Run a Windows program (.exe / .msi)…", new View.OnClickListener() {
+        root.addView( Ui.section( this, "Programs" ));
+        Ui.Grid actions = new Ui.Grid( this, 170, 10 );
+        actions.addView( actionTile( "Run a program", ".exe, .msi or .bat file", false, new View.OnClickListener() {
             public void onClick( View v ) { pickProgram(); }} ));
-        root.addView( button( "Wine desktop (file manager)", runner( "Wine desktop", "explorer.exe" )));
-        root.addView( button( "Command prompt", runner( "Command prompt", "wineconsole.exe" )));
-        root.addView( button( "Wine settings (winecfg)", runner( "Wine settings", "winecfg.exe" )));
-        root.addView( button( "Task manager", runner( "Task manager", "taskmgr.exe" )));
-        root.addView( button( "Stop Wine", new View.OnClickListener() {
+        actions.addView( actionTile( "Wine desktop", "File manager", false, runner( "Wine desktop", "explorer.exe" )));
+        actions.addView( actionTile( "Command prompt", "wineconsole", false, runner( "Command prompt", "wineconsole.exe" )));
+        actions.addView( actionTile( "Wine settings", "winecfg", false, runner( "Wine settings", "winecfg.exe" )));
+        actions.addView( actionTile( "Task manager", "Running programs", false, runner( "Task manager", "taskmgr.exe" )));
+        actions.addView( actionTile( "Stop Wine", "Closes all programs", true, new View.OnClickListener() {
             public void onClick( View v ) { stopWine(); }} ));
+        root.addView( actions );
 
-        TextView recent_title = new TextView( this );
-        recent_title.setText( "Recent programs" );
-        recent_title.setTextSize( TypedValue.COMPLEX_UNIT_SP, 20 );
-        recent_title.setPadding( 0, dp( 24 ), 0, dp( 8 ));
-        root.addView( recent_title );
-
+        root.addView( Ui.section( this, "Recent" ));
         recent_list = new LinearLayout( this );
         recent_list.setOrientation( LinearLayout.VERTICAL );
         root.addView( recent_list );
 
-        TextView hint = new TextView( this );
-        hint.setText( "Tips: drive D: is your phone storage and drive Z: is the whole file "
-                      + "system. Tap the ⌨ button in Wine to show the on-screen keyboard. "
-                      + "Touches are left clicks; a USB or Bluetooth mouse and keyboard work too." );
-        hint.setPadding( 0, dp( 24 ), 0, 0 );
+        root.addView( Ui.section( this, "Settings" ));
+        root.addView( mouseSpeedSetting() );
+
+        TextView hint = Ui.text( this, "Drive D: is your phone storage and drive Z: the whole file system. "
+                                 + "Tap the ⌨ button in Wine for the on-screen keyboard; touches are left "
+                                 + "clicks, and USB or Bluetooth mice and keyboards work too. Long-press "
+                                 + "a game for more options.", 13, Ui.TEXT_SECONDARY, false );
+        hint.setPadding( 0, dp( 28 ), 0, 0 );
+        hint.setLineSpacing( dp( 2 ), 1 );
         root.addView( hint );
 
         ScrollView scroll = new ScrollView( this );
+        scroll.setBackgroundColor( Ui.BACKGROUND );
+        scroll.setFillViewport( true );
         scroll.addView( root );
         setContentView( scroll );
+    }
+
+    private View topBar()
+    {
+        LinearLayout bar = new LinearLayout( this );
+        bar.setGravity( Gravity.CENTER_VERTICAL );
+
+        ImageView icon = new ImageView( this );
+        icon.setImageResource( R.drawable.wine );
+        bar.addView( icon, new LinearLayout.LayoutParams( dp( 40 ), dp( 40 )));
+
+        LinearLayout titles = new LinearLayout( this );
+        titles.setOrientation( LinearLayout.VERTICAL );
+        titles.setPadding( dp( 12 ), 0, dp( 12 ), 0 );
+        titles.addView( Ui.text( this, "WineDroid", 24, Ui.TEXT, true ));
+        titles.addView( Ui.text( this, "Windows programs on x86_64 Android", 13, Ui.TEXT_SECONDARY, false ));
+        bar.addView( titles, new LinearLayout.LayoutParams( 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1 ));
+
+        running_pill = Ui.pill( this, "Back to Windows", true, new View.OnClickListener() {
+            public void onClick( View v ) { startActivity( new Intent( LauncherActivity.this, WineActivity.class )); }} );
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams( LinearLayout.LayoutParams.WRAP_CONTENT,
+                                                                      LinearLayout.LayoutParams.WRAP_CONTENT );
+        lp.rightMargin = dp( 12 );
+        bar.addView( running_pill, lp );
+
+        /* each runtime has its own C: drive, so programs installed with one
+         * are not visible to the other */
+        runtime_pills = new LinearLayout( this );
+        runtime_pills.setPadding( dp( 3 ), dp( 3 ), dp( 3 ), dp( 3 ));
+        runtime_pills.setBackground( Ui.rounded( this, Ui.SURFACE, Ui.OUTLINE, 22 ));
+        for (final String[] r : RUNTIMES)
+        {
+            if (!hasRuntime( r[0] )) continue;
+            TextView t = Ui.text( this, r[1], 14, Ui.TEXT, true );
+            t.setTag( r[0] );
+            t.setPadding( dp( 14 ), dp( 7 ), dp( 14 ), dp( 7 ));
+            t.setOnClickListener( new View.OnClickListener() {
+                public void onClick( View v ) { selectRuntime( r[0] ); }} );
+            runtime_pills.addView( t );
+        }
+        bar.addView( runtime_pills );
+        checkRuntime( runtime );
+        return bar;
+    }
+
+    private void updateRunning()
+    {
+        if (running_pill != null)
+            running_pill.setVisibility( WineActivity.getRunningRuntime() != null ? View.VISIBLE : View.GONE );
+    }
+
+    private View actionTile( String title, String subtitle, boolean danger, View.OnClickListener l )
+    {
+        LinearLayout tile = new LinearLayout( this );
+        tile.setOrientation( LinearLayout.VERTICAL );
+        tile.setPadding( dp( 16 ), dp( 14 ), dp( 16 ), dp( 14 ));
+        Ui.card( tile, Ui.SURFACE, Ui.OUTLINE, 12 );
+        tile.addView( Ui.text( this, title, 15, danger ? Ui.DANGER : Ui.TEXT, true ));
+        TextView sub = Ui.text( this, subtitle, 12, Ui.TEXT_SECONDARY, false );
+        sub.setPadding( 0, dp( 2 ), 0, 0 );
+        tile.addView( sub );
+        tile.setOnClickListener( l );
+        return tile;
     }
 
     /* games that hide the cursor get raw mouse motion, which Android's pointer
@@ -220,33 +260,35 @@ public class LauncherActivity extends Activity
 
         LinearLayout box = new LinearLayout( this );
         box.setOrientation( LinearLayout.VERTICAL );
-        box.setPadding( 0, 0, 0, dp( 16 ));
-        final TextView label = new TextView( this );
-        label.setText( "Mouse speed in games that capture the mouse: " + steps[pos] + "×" );
-        box.addView( label );
-        android.widget.SeekBar bar = new android.widget.SeekBar( this );
+        box.setPadding( dp( 16 ), dp( 14 ), dp( 16 ), dp( 10 ));
+        box.setBackground( Ui.rounded( this, Ui.SURFACE, Ui.OUTLINE, 12 ));
+
+        LinearLayout head = new LinearLayout( this );
+        head.addView( Ui.text( this, "Mouse speed in games", 15, Ui.TEXT, true ),
+                      new LinearLayout.LayoutParams( 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1 ));
+        final TextView value = Ui.text( this, steps[pos] + "×", 15, Ui.ACCENT, true );
+        head.addView( value );
+        box.addView( head );
+        box.addView( Ui.text( this, "For games that hide the cursor and capture the mouse.", 12,
+                              Ui.TEXT_SECONDARY, false ));
+
+        SeekBar bar = new SeekBar( this );
         bar.setMax( steps.length - 1 );
         bar.setProgress( pos );
-        bar.setOnSeekBarChangeListener( new android.widget.SeekBar.OnSeekBarChangeListener() {
-            public void onProgressChanged( android.widget.SeekBar b, int p, boolean user )
+        bar.setProgressTintList( ColorStateList.valueOf( Ui.ACCENT ));
+        bar.setThumbTintList( ColorStateList.valueOf( Ui.ACCENT ));
+        bar.setPadding( 0, dp( 12 ), 0, dp( 6 ));
+        bar.setOnSeekBarChangeListener( new SeekBar.OnSeekBarChangeListener() {
+            public void onProgressChanged( SeekBar b, int p, boolean user )
             {
-                label.setText( "Mouse speed in games that capture the mouse: " + steps[p] + "×" );
+                value.setText( steps[p] + "×" );
                 prefs.edit().putFloat( WineActivity.PREF_MOUSE_SPEED, steps[p] ).apply();
             }
-            public void onStartTrackingTouch( android.widget.SeekBar b ) {}
-            public void onStopTrackingTouch( android.widget.SeekBar b ) {}
+            public void onStartTrackingTouch( SeekBar b ) {}
+            public void onStopTrackingTouch( SeekBar b ) {}
         });
         box.addView( bar );
         return box;
-    }
-
-    private Button button( String label, View.OnClickListener listener )
-    {
-        Button b = new Button( this );
-        b.setText( label );
-        b.setAllCaps( false );
-        b.setOnClickListener( listener );
-        return b;
     }
 
     private View.OnClickListener runner( final String label, final String cmdline )
@@ -298,7 +340,8 @@ public class LauncherActivity extends Activity
             return;
         }
         saveRuntime( name );
-        refreshShortcuts();
+        checkRuntime( name );
+        refreshLibrary();
         refreshRecent();
     }
 
@@ -310,15 +353,19 @@ public class LauncherActivity extends Activity
 
     private void checkRuntime( String name )
     {
-        for (int i = 0; i < RUNTIMES.length; i++)
-            if (RUNTIMES[i][0].equals( name ) && runtime_group.findViewById( i + 1 ) != null)
-                runtime_group.check( i + 1 );
+        if (runtime_pills == null) return;
+        for (int i = 0; i < runtime_pills.getChildCount(); i++)
+        {
+            TextView t = (TextView)runtime_pills.getChildAt( i );
+            boolean selected = name.equals( t.getTag() );
+            t.setTextColor( selected ? Color.WHITE : Ui.TEXT_SECONDARY );
+            t.setBackground( selected ? Ui.rounded( this, Ui.ACCENT, 0, 19 ) : null );
+        }
     }
 
     private int dp( int v )
     {
-        return (int)TypedValue.applyDimension( TypedValue.COMPLEX_UNIT_DIP, v,
-                                               getResources().getDisplayMetrics() );
+        return Ui.dp( this, v );
     }
 
     // Running programs
@@ -326,6 +373,8 @@ public class LauncherActivity extends Activity
     private void runWine( String label, String cmdline, boolean remember )
     {
         if (remember) addRecent( label, cmdline );
+        getSharedPreferences( PREFS, MODE_PRIVATE ).edit()
+            .putString( KEY_LAST_PLAYED + "." + runtime, cmdline ).apply();
         Intent intent = new Intent( this, WineActivity.class );
         intent.putExtra( WineActivity.EXTRA_CMDLINE, cmdline );
         intent.putExtra( WineActivity.EXTRA_RUNTIME, runtime );
@@ -477,22 +526,30 @@ public class LauncherActivity extends Activity
         List<String> list = loadRecent();
         if (list.isEmpty())
         {
-            TextView none = new TextView( this );
-            none.setText( "Nothing yet." );
-            recent_list.addView( none );
+            recent_list.addView( Ui.text( this, "Programs you open from a file show up here.", 14,
+                                          Ui.TEXT_SECONDARY, false ));
             return;
         }
-        for (final String entry : list)
+        for (final String entry : list.subList( 0, Math.min( list.size(), MAX_RECENT_SHOWN )))
         {
             final String[] parts = entry.split( "\t", 2 );
             if (parts.length != 2) continue;
-            Button b = button( parts[0], runner( parts[0], parts[1] ));
-            b.setOnLongClickListener( new View.OnLongClickListener() {
+            LinearLayout row = new LinearLayout( this );
+            row.setOrientation( LinearLayout.VERTICAL );
+            row.setPadding( dp( 16 ), dp( 11 ), dp( 16 ), dp( 11 ));
+            Ui.card( row, Ui.SURFACE, Ui.OUTLINE, 10 );
+            row.addView( Ui.text( this, programLabel( parts[0] ), 15, Ui.TEXT, true ));
+            TextView path = Ui.text( this, recentPath( parts[1] ), 12, Ui.TEXT_SECONDARY, false );
+            path.setSingleLine( true );
+            path.setEllipsize( TextUtils.TruncateAt.MIDDLE );
+            row.addView( path );
+            row.setOnClickListener( runner( parts[0], parts[1] ));
+            row.setOnLongClickListener( new View.OnLongClickListener() {
                 public boolean onLongClick( View v )
                 {
                     new AlertDialog.Builder( LauncherActivity.this )
                         .setTitle( parts[0] )
-                        .setItems( new String[]{ "Add to shortcuts", "Remove from recent" },
+                        .setItems( new String[]{ "Add to library", "Remove from recent" },
                                    new DialogInterface.OnClickListener() {
                             public void onClick( DialogInterface d, int which )
                             {
@@ -509,8 +566,22 @@ public class LauncherActivity extends Activity
                         .show();
                     return true;
                 }} );
-            recent_list.addView( b );
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams( LinearLayout.LayoutParams.MATCH_PARENT,
+                                                                          LinearLayout.LayoutParams.WRAP_CONTENT );
+            lp.bottomMargin = dp( 8 );
+            recent_list.addView( row, lp );
         }
+    }
+
+    /* 'start /unix "/data/.../drive_c/x/y.exe"' -> 'C:\x\y.exe' */
+    private String recentPath( String cmdline )
+    {
+        Matcher m = Pattern.compile( "\"([^\"]*)\"" ).matcher( cmdline );
+        if (!m.find()) return cmdline;
+        String path = m.group( 1 );
+        String drive_c = new File( prefixDir(), "drive_c" ).getPath();
+        if (path.startsWith( drive_c )) return "C:" + path.substring( drive_c.length() ).replace( '/', '\\' );
+        return path;
     }
 
     // Shortcuts, stored per runtime as "label\tcmdline" lines like the recent list
@@ -557,31 +628,179 @@ public class LauncherActivity extends Activity
         }
         list.add( new String[]{ label.replace( '\t', ' ' ).replace( '\n', ' ' ), cmdline } );
         saveShortcuts( list );
-        refreshShortcuts();
+        refreshLibrary();
         Toast.makeText( this, "Added " + label, Toast.LENGTH_SHORT ).show();
     }
 
-    private void refreshShortcuts()
+    private static final Pattern APPLAUNCH = Pattern.compile( "-applaunch (\\d+)" );
+
+    private static String steamAppId( String cmdline )
     {
-        shortcut_list.removeAllViews();
-        final List<String[]> list = loadShortcuts();
-        if (list.isEmpty())
+        Matcher m = APPLAUNCH.matcher( cmdline );
+        return m.find() ? m.group( 1 ) : null;
+    }
+
+    /* Steam's cached artwork for a game, directly in its directory or in one of
+     * the hashed subdirectories newer clients use */
+    private File steamArt( String appid, String... names )
+    {
+        if (appid == null) return null;
+        File dir = new File( prefixDir(), "drive_c/Program Files (x86)/Steam/appcache/librarycache/" + appid );
+        File[] subdirs = dir.listFiles();
+        for (String name : names)
         {
-            TextView none = new TextView( this );
-            none.setText( "Add programs and Steam games here to start them with one tap." );
-            shortcut_list.addView( none );
+            File f = new File( dir, name );
+            if (f.isFile()) return f;
+            if (subdirs == null) continue;
+            for (File sub : subdirs)
+                if (sub.isDirectory() && (f = new File( sub, name )).isFile()) return f;
+        }
+        return null;
+    }
+
+    /* the library: the shortcuts first, in their order, then the installed
+     * Steam games that aren't shortcuts */
+    private void refreshLibrary()
+    {
+        library_grid.removeAllViews();
+        hero_box.removeAllViews();
+        final List<String[]> shortcuts = loadShortcuts();
+        List<String[]> steam = new ArrayList<String[]>();
+        findSteamGames( steam );
+
+        List<String[]> items = new ArrayList<String[]>();  /* label, cmdline, shortcut index */
+        for (int i = 0; i < shortcuts.size(); i++)
+            items.add( new String[]{ shortcuts.get( i )[0], shortcuts.get( i )[1], String.valueOf( i ) } );
+        for (String[] g : steam)
+        {
+            boolean dup = false;
+            for (String[] e : shortcuts) if (e[1].equals( g[1] )) dup = true;
+            if (!dup) items.add( new String[]{ g[0], g[1], "-1" } );
+        }
+
+        if (items.isEmpty())
+        {
+            library_grid.addView( Ui.text( this, "Install games with Steam (Proton runtime) or add "
+                                           + "programs with + Add to start them from here.", 14,
+                                           Ui.TEXT_SECONDARY, false ));
             return;
         }
-        for (int i = 0; i < list.size(); i++)
+
+        String last = getSharedPreferences( PREFS, MODE_PRIVATE ).getString( KEY_LAST_PLAYED + "." + runtime, "" );
+        for (String[] item : items)
+            if (item[1].equals( last ) && steamArt( steamAppId( item[1] ), "library_hero.jpg" ) != null)
+                hero_box.addView( hero( item ));
+
+        for (String[] item : items) library_grid.addView( gameCard( item ));
+    }
+
+    private void libraryMenu( final String[] item )
+    {
+        int index = Integer.parseInt( item[2] );
+        if (index >= 0)
         {
-            final int index = i;
-            final String[] e = list.get( i );
-            Button b = button( e[0], new View.OnClickListener() {
-                public void onClick( View v ) { runWine( e[0], e[1], false ); }} );
-            b.setOnLongClickListener( new View.OnLongClickListener() {
-                public boolean onLongClick( View v ) { shortcutMenu( index, e ); return true; }} );
-            shortcut_list.addView( b );
+            shortcutMenu( index, new String[]{ item[0], item[1] } );
+            return;
         }
+        new AlertDialog.Builder( this )
+            .setTitle( item[0] )
+            .setItems( new String[]{ "Add to home screen", "Pin to the top of the library" },
+                       new DialogInterface.OnClickListener() {
+                public void onClick( DialogInterface d, int which )
+                {
+                    if (which == 0) pinShortcut( new String[]{ item[0], item[1] } );
+                    else addShortcut( item[0], item[1] );
+                }} )
+            .show();
+    }
+
+    private View gameCard( final String[] item )
+    {
+        String appid = steamAppId( item[1] );
+        LinearLayout card = new LinearLayout( this );
+        card.setOrientation( LinearLayout.VERTICAL );
+        Ui.card( card, Ui.SURFACE, Ui.OUTLINE, 14 );
+
+        File art = steamArt( appid, "header.jpg", "library_header.jpg", "capsule_616x353.jpg" );
+        FrameLayout top = new FrameLayout( this );
+        Ui.AspectImage image = new Ui.AspectImage( this, 460f / 215f );
+        image.setBackgroundColor( Ui.SURFACE_ALT );
+        top.addView( image );
+        if (art != null) Ui.load( image, art, dp( 320 ));
+        else
+        {
+            /* no artwork: the initial on a blue gradient */
+            image.setBackground( new GradientDrawable( GradientDrawable.Orientation.TL_BR,
+                                                       new int[]{ 0xFF1B4F82, 0xFF1C1C2A } ));
+            TextView initial = Ui.text( this, item[0].substring( 0, 1 ).toUpperCase(), 44, Ui.TEXT, true );
+            initial.setGravity( Gravity.CENTER );
+            top.addView( initial, new FrameLayout.LayoutParams( FrameLayout.LayoutParams.MATCH_PARENT,
+                                                                FrameLayout.LayoutParams.MATCH_PARENT ));
+        }
+        card.addView( top );
+
+        LinearLayout text = new LinearLayout( this );
+        text.setOrientation( LinearLayout.VERTICAL );
+        text.setPadding( dp( 14 ), dp( 10 ), dp( 14 ), dp( 12 ));
+        TextView title = Ui.text( this, item[0], 15, Ui.TEXT, true );
+        title.setSingleLine( true );
+        title.setEllipsize( TextUtils.TruncateAt.END );
+        text.addView( title );
+        text.addView( Ui.text( this, appid != null ? "Steam" : "Program", 12, Ui.TEXT_SECONDARY, false ));
+        card.addView( text );
+
+        card.setOnClickListener( new View.OnClickListener() {
+            public void onClick( View v ) { runWine( item[0], item[1], false ); }} );
+        card.setOnLongClickListener( new View.OnLongClickListener() {
+            public boolean onLongClick( View v ) { libraryMenu( item ); return true; }} );
+        return card;
+    }
+
+    /* the last played game, large, with its hero artwork and logo */
+    private View hero( final String[] item )
+    {
+        String appid = steamAppId( item[1] );
+        FrameLayout hero = new FrameLayout( this );
+        Ui.card( hero, Ui.SURFACE, Ui.OUTLINE, 18 );
+
+        Ui.AspectImage image = new Ui.AspectImage( this, 3.4f );
+        hero.addView( image );
+        Ui.load( image, steamArt( appid, "library_hero.jpg" ), dp( 900 ));
+
+        View shade = new View( this );
+        shade.setBackground( new GradientDrawable( GradientDrawable.Orientation.LEFT_RIGHT,
+                                                   new int[]{ 0xE012121B, 0x6012121B, 0x0012121B } ));
+        hero.addView( shade, new FrameLayout.LayoutParams( FrameLayout.LayoutParams.MATCH_PARENT,
+                                                           FrameLayout.LayoutParams.MATCH_PARENT ));
+
+        LinearLayout info = new LinearLayout( this );
+        info.setOrientation( LinearLayout.VERTICAL );
+        info.setGravity( Gravity.BOTTOM );
+        info.setPadding( dp( 24 ), dp( 20 ), dp( 24 ), dp( 20 ));
+        File logo = steamArt( appid, "logo.png" );
+        if (logo != null)
+        {
+            ImageView logo_view = new ImageView( this );
+            logo_view.setScaleType( ImageView.ScaleType.FIT_START );
+            Ui.load( logo_view, logo, dp( 280 ));
+            info.addView( logo_view, new LinearLayout.LayoutParams( dp( 280 ), dp( 90 )));
+        }
+        else info.addView( Ui.text( this, item[0], 26, Ui.TEXT, true ));
+        TextView label = Ui.text( this, "CONTINUE PLAYING", 12, Ui.TEXT_SECONDARY, true );
+        label.setLetterSpacing( 0.08f );
+        label.setPadding( 0, dp( 10 ), 0, dp( 10 ));
+        info.addView( label );
+        LinearLayout buttons = new LinearLayout( this );
+        buttons.addView( Ui.pill( this, "▶  Play", true, new View.OnClickListener() {
+            public void onClick( View v ) { runWine( item[0], item[1], false ); }} ));
+        info.addView( buttons );
+        hero.addView( info, new FrameLayout.LayoutParams( FrameLayout.LayoutParams.MATCH_PARENT,
+                                                          FrameLayout.LayoutParams.MATCH_PARENT ));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams( LinearLayout.LayoutParams.MATCH_PARENT,
+                                                                      LinearLayout.LayoutParams.WRAP_CONTENT );
+        lp.topMargin = dp( 24 );
+        hero.setLayoutParams( lp );
+        return hero;
     }
 
     private void shortcutMenu( final int index, final String[] entry )
@@ -607,7 +826,7 @@ public class LauncherActivity extends Activity
                         break;
                     }
                     saveShortcuts( list );
-                    refreshShortcuts();
+                    refreshLibrary();
                 }} )
             .show();
     }
@@ -629,7 +848,7 @@ public class LauncherActivity extends Activity
                     if (label.length() == 0 || index >= list.size()) return;
                     list.get( index )[0] = label;
                     saveShortcuts( list );
-                    refreshShortcuts();
+                    refreshLibrary();
                 }} )
             .setNegativeButton( android.R.string.cancel, null )
             .show();
