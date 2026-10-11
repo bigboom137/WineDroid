@@ -1,0 +1,28 @@
+Subject: [PATCH] win32u: Take the system DPI from WINEDROID_DPI on Android.
+
+The DPI of the Android screen reached Wine through the driver's
+config_changed event, which stores it in the registry. The desktop
+process has read the system DPI by then, and gives it to the display
+source, so the monitor DPI (used by per-monitor aware programs such as
+Chromium and VS Code) stayed at the previous session's value.
+---
+diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+index eee8149..863b4c4 100644
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -5889,6 +5900,15 @@ void sysparams_init(void)
+             NtClose( hkey );
+         }
+     }
++#ifdef __ANDROID__
++    /* WineDroid passes the DPI of the Android screen: its desktop process starts
++     * before the driver can store it in the registry, and gave the monitor the
++     * DPI of the previous session */
++    {
++        const char *env = getenv( "WINEDROID_DPI" );
++        if (env && atoi( env ) > 0) system_dpi = atoi( env );
++    }
++#endif
+     if (!system_dpi) system_dpi = USER_DEFAULT_SCREEN_DPI;
+ 
+     /* FIXME: what do the DpiScalingVer flags mean? */

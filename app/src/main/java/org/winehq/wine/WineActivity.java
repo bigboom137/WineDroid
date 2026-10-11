@@ -33,9 +33,11 @@ import android.net.ConnectivityManager;
 import android.net.LinkProperties;
 import android.net.Network;
 import android.net.RouteInfo;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.preference.PreferenceManager;
+import android.system.Os;
 import android.util.Log;
 import android.text.InputType;
 import android.view.Gravity;
@@ -119,6 +121,19 @@ public class WineActivity extends Activity
     /* launcher setting: factor applied to mouse motion while the pointer is captured */
     public static final String PREFS_LAUNCHER = "launcher";
     public static final String PREF_MOUSE_SPEED = "mouse_speed";
+    /* launcher setting: Wine's screen size as "WxH", scaled to fit the Android
+     * window; empty for the window's own size */
+    public static final String PREF_RESOLUTION = "resolution";
+    /* launcher setting: WALLPAPER_DEFAULT, WALLPAPER_CUSTOM (the image in
+     * files/WALLPAPER_FILE) or WALLPAPER_NONE (Wine's desktop color) */
+    public static final String PREF_WALLPAPER = "wallpaper";
+    public static final String WALLPAPER_DEFAULT = "default";
+    public static final String WALLPAPER_CUSTOM = "custom";
+    public static final String WALLPAPER_NONE = "none";
+    /* launcher setting: Windows UI scale in percent (100 = 96 DPI), 0 to match
+     * Android's own scale */
+    public static final String PREF_UI_SCALE = "ui_scale";
+    public static final String WALLPAPER_FILE = "wallpaper";
     /* Wine build to run, the name of its directory in the assets */
     public static final String EXTRA_RUNTIME = "org.winehq.wine.RUNTIME";
     public static final String RUNTIME_WINE = "wine";
@@ -378,8 +393,14 @@ public class WineActivity extends Activity
         env.put( "LD_LIBRARY_PATH", libdir.toString() + ":" + getApplicationInfo().nativeLibraryDir );
         env.put( "LC_ALL", locale );
         env.put( "LANG", locale );
-        env.put( "PATH", bindir.toString() + ":" + System.getenv( "PATH" ));
-        env.put( "WINEDROID_ROUTES", new File( getFilesDir(), "net/routes" ).toString() );
+        File toolsdir = installUrlOpener();
+        /* bindir first: stopWine() finds the wineserver there */
+        env.put( "PATH", bindir.toString() + ":" + (toolsdir != null ? toolsdir + ":" : "") + System.getenv( "PATH" ));
+        /* win32u reads it at startup; the registry value the driver writes on
+         * config_changed comes too late for the desktop process */
+        load_resolution();
+        env.put( "WINEDROID_DPI", Integer.toString( desktop_dpi() ));
+        env.put( "WINEDROID_ROUTES",new File( getFilesDir(), "net/routes" ).toString() );
         env.put( "WINEDROID_DNS", new File( getFilesDir(), "net/dns" ).toString() );
         watchNetwork( getApplicationContext() );
         if (RUNTIME_PROTON.equals( wine_runtime ))
@@ -576,6 +597,80 @@ public class WineActivity extends Activity
      * (patches 0012 and 0013). Without a default route Windows programs
      * think they are offline. Both are re-read on every query, so rewriting
      * them when the network changes is enough. */
+    /* winebrowser (ShellExecute of http/https/mailto URLs: sign-in pages of VS Code,
+     * Steam, ...) runs xdg-open, which Android doesn't have, and gives up with
+     * "could not find a suitable app". Provide one that passes the URL through a
+     * FIFO to us, and open it with the Android browser. A 127.0.0.1 callback of the
+     * sign-in still reaches the Windows program since all apps share loopback. */
+    private File installUrlOpener()
+    {
+        File dir = new File( getFilesDir(), "bin" );
+        final File fifo = new File( getFilesDir(), "open-url" );
+        File script = new File( dir, "xdg-open" );
+        try
+        {
+            dir.mkdirs();
+            fifo.delete();
+            Os.mkfifo( fifo.toString(), 0600 );
+            try (FileOutputStream out = new FileOutputStream( script ))
+            {
+                out.write( ("#!/system/bin/sh\nprintf '%s\\n' \"$1\" > " + fifo + "\n").getBytes() );
+            }
+            script.setExecutable( true );
+        }
+        catch (Exception e)
+        {
+            Log.e( LOGTAG, "can't set up the URL opener: " + e );
+            return null;
+        }
+
+        Thread thread = new Thread( new Runnable()
+        {
+            public void run()
+            {
+                for (;;)
+                {
+                    /* blocks until xdg-open opens the FIFO for writing */
+                    try (BufferedReader reader = new BufferedReader( new FileReader( fifo )))
+                    {
+                        String line;
+                        while ((line = reader.readLine()) != null) openUrl( line.trim() );
+                    }
+                    catch (IOException e)
+                    {
+                        Log.e( LOGTAG, "URL opener: " + e );
+                        return;
+                    }
+                }
+            }
+        }, "url-opener" );
+        thread.setDaemon( true );
+        thread.start();
+        return dir;
+    }
+
+    private void openUrl( final String url )
+    {
+        if (url.isEmpty()) return;
+        Log.i( LOGTAG, "opening URL " + url );
+        runOnUiThread( new Runnable()
+        {
+            public void run()
+            {
+                try
+                {
+                    Intent intent = new Intent( Intent.ACTION_VIEW, Uri.parse( url ));
+                    intent.addFlags( Intent.FLAG_ACTIVITY_NEW_TASK );
+                    startActivity( intent );
+                }
+                catch (Exception e)
+                {
+                    Log.e( LOGTAG, "can't open " + url + ": " + e );
+                }
+            }
+        });
+    }
+
     private static void watchNetwork( final Context context )
     {
         final ConnectivityManager cm = (ConnectivityManager)context.getSystemService( Context.CONNECTIVITY_SERVICE );
@@ -752,6 +847,7 @@ public class WineActivity extends Activity
         static protected final int HWND_MESSAGE = 0xfffffffd;
         static protected final int SWP_NOZORDER = 0x04;
         static protected final int WS_VISIBLE = 0x10000000;
+        static protected final int WS_MINIMIZE = 0x20000000;
 
         protected int hwnd;
         protected int owner;
@@ -933,7 +1029,11 @@ public class WineActivity extends Activity
             this.client_rect = client_rect;
             this.style = style;
             this.owner = owner;
-            visible = (style & WS_VISIBLE) != 0;
+            /* Wine keeps minimized windows visible, parked at -32000,-32000; their
+             * client SurfaceView stayed on screen as a black box, so take them out
+             * (minimized MDI children are drawn as icons in their parent) */
+            visible = (style & WS_VISIBLE) != 0 &&
+                      ((style & WS_MINIMIZE) == 0 || parent != desktop_window);
 
             Log.i( LOGTAG, String.format( "pos changed hwnd %08x after %08x owner %08x style %08x win %s client %s visible %s flags %08x",
                                           hwnd, insert_after, owner, style, window_rect, client_rect, visible_rect, flags ));
@@ -946,8 +1046,8 @@ public class WineActivity extends Activity
                                          visible_rect.right, visible_rect.bottom );
                 if (parent != null)
                 {
-                    if (!was_visible && (style & WS_VISIBLE) != 0) add_view_to_parent();
-                    else if (was_visible && (style & WS_VISIBLE) == 0) remove_view_from_parent();
+                    if (!was_visible && visible) add_view_to_parent();
+                    else if (was_visible && !visible) remove_view_from_parent();
                     else if (visible && (flags & SWP_NOZORDER) == 0) sync_views_zorder();
                 }
             }
@@ -1286,7 +1386,11 @@ public class WineActivity extends Activity
             if (window.parent != null && window.parent != desktop_window) return false;  // let the parent handle it
 
             if (touchpad_gesture( window, event )) return true;
-            if (event.getToolType( event.getActionIndex() ) == MotionEvent.TOOL_TYPE_FINGER)
+            /* touchpads report fingers too, but from a mouse source with button press/release
+             * events of their own; as touches, each click got a second button up, and VS Code's
+             * menu bar closed a menu on the mouse up after the one that opened it */
+            if (event.getToolType( event.getActionIndex() ) == MotionEvent.TOOL_TYPE_FINGER &&
+                event.isFromSource( InputDevice.SOURCE_TOUCHSCREEN ))
                 return finger_event( window, event );
 
             int[] pos = new int[2];
@@ -1319,8 +1423,13 @@ public class WineActivity extends Activity
         {
             super( context );
             desktop_window = new WineWindow( hwnd, null, 1.0f );
+            wallpaper = create_wallpaper_view();
+            if (wallpaper != null) addView( wallpaper );
             addView( desktop_window.create_whole_view() );
             desktop_window.client_group.bringToFront();
+            /* the wallpaper shows instead of the desktop window Wine paints; it
+             * still gets the touches on the desktop, so make it transparent */
+            if (wallpaper != null) desktop_window.window_group.get_content_view().setAlpha( 0 );
 
             message_window = new WineWindow( WineWindow.HWND_MESSAGE, null, 1.0f );
             message_window.create_window_groups();
@@ -1377,18 +1486,145 @@ public class WineActivity extends Activity
             return super.dispatchKeyEvent( event );
         }
 
+        private View wallpaper;
+
+        /* With a resolution set in the launcher, the desktop is laid out at that
+         * size and scaled to fit the Android window, keeping its aspect ratio.
+         * Android maps touch and mouse positions through the scale, so views
+         * below still get them in Wine's pixels. */
+        @Override
+        protected void onMeasure( int width_spec, int height_spec )
+        {
+            int width = MeasureSpec.getSize( width_spec ), height = MeasureSpec.getSize( height_spec );
+            float scale = 1;
+
+            if (res_width > 0 && res_height > 0 && width > 0 && height > 0)
+            {
+                scale = Math.min( (float)width / res_width, (float)height / res_height );
+                setTranslationX( Math.round( (width - res_width * scale) / 2 ));
+                setTranslationY( Math.round( (height - res_height * scale) / 2 ));
+                width = res_width;
+                height = res_height;
+            }
+            setPivotX( 0 );
+            setPivotY( 0 );
+            setScaleX( scale );
+            setScaleY( scale );
+            desktop_scale = scale;
+            setMeasuredDimension( width, height );
+        }
+
         @Override
         protected void onSizeChanged( int width, int height, int old_width, int old_height )
         {
-            Log.i( LOGTAG, String.format( "desktop size %dx%d", width, height ));
+            Log.i( LOGTAG, String.format( "desktop size %dx%d scale %.3f", width, height, desktop_scale ));
             wine_desktop_changed( width, height );
         }
 
         @Override
         protected void onLayout( boolean changed, int left, int top, int right, int bottom )
         {
-            // nothing to do
+            // Wine places the windows, only the wallpaper covers the desktop
+            if (wallpaper != null) wallpaper.layout( 0, 0, right - left, bottom - top );
         }
+    }
+
+    /* Wine's screen size from the launcher setting, 0 to follow the window */
+    private int res_width, res_height;
+    private float desktop_scale = 1;
+
+    private void load_resolution()
+    {
+        String res = getSharedPreferences( PREFS_LAUNCHER, MODE_PRIVATE ).getString( PREF_RESOLUTION, "" );
+        String[] parts = res.split( "x" );
+        res_width = res_height = 0;
+        if (parts.length != 2) return;
+        try
+        {
+            res_width = Integer.parseInt( parts[0] );
+            res_height = Integer.parseInt( parts[1] );
+        }
+        catch (NumberFormatException e)
+        {
+            res_width = res_height = 0;
+        }
+        if (res_width < 640 || res_height < 480) res_width = res_height = 0;
+    }
+
+    /* the device DPI scaled like the desktop, so that programs keep their size
+     * on screen; set once at startup, Wine reads it when it starts. Windows'
+     * 100% is 96 DPI and Android's is 160, so map Android's density to the same
+     * scale factor (260 dpi gave Wine 270% where Android uses 162%), unless the
+     * launcher's UI scale setting asks for another one. */
+    private int desktop_dpi()
+    {
+        int dpi = Math.round( getResources().getConfiguration().densityDpi * 96f /
+                              android.util.DisplayMetrics.DENSITY_DEFAULT );
+        int scale = getSharedPreferences( PREFS_LAUNCHER, MODE_PRIVATE ).getInt( PREF_UI_SCALE, 0 );
+        if (scale > 0) dpi = Math.round( scale * 96f / 100 );
+        android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+        int screen = Math.max( dm.widthPixels, dm.heightPixels );
+        if (res_width <= 0 || screen <= 0) return dpi;
+        return Math.max( 96, Math.round( dpi * (float)Math.max( res_width, res_height ) / screen ));
+    }
+
+    private View create_wallpaper_view()
+    {
+        String mode = getSharedPreferences( PREFS_LAUNCHER, MODE_PRIVATE ).getString( PREF_WALLPAPER, WALLPAPER_DEFAULT );
+        if (WALLPAPER_NONE.equals( mode )) return null;
+        if (WALLPAPER_CUSTOM.equals( mode ))
+        {
+            Bitmap bitmap = load_wallpaper( new File( getFilesDir(), WALLPAPER_FILE ));
+            if (bitmap != null)
+            {
+                android.widget.ImageView view = new android.widget.ImageView( this );
+                view.setScaleType( android.widget.ImageView.ScaleType.CENTER_CROP );
+                view.setImageBitmap( bitmap );
+                return view;
+            }
+            Log.w( LOGTAG, "could not load the wallpaper, using the default one" );
+        }
+        View view = new View( this );
+        view.setBackground( default_wallpaper() );
+        return view;
+    }
+
+    /* decoded no larger than needed for the screen, photos can be huge */
+    private Bitmap load_wallpaper( File file )
+    {
+        android.graphics.BitmapFactory.Options opts = new android.graphics.BitmapFactory.Options();
+        opts.inJustDecodeBounds = true;
+        android.graphics.BitmapFactory.decodeFile( file.getPath(), opts );
+        if (opts.outWidth <= 0 || opts.outHeight <= 0) return null;
+        android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+        int target = Math.max( dm.widthPixels, dm.heightPixels );
+        opts.inSampleSize = 1;
+        while (Math.min( opts.outWidth, opts.outHeight ) / (opts.inSampleSize * 2) >= Math.min( target, 2048 ))
+            opts.inSampleSize *= 2;
+        opts.inJustDecodeBounds = false;
+        return android.graphics.BitmapFactory.decodeFile( file.getPath(), opts );
+    }
+
+    /* dark blue gradient with a glow in the launcher's accent color */
+    public static android.graphics.drawable.Drawable default_wallpaper()
+    {
+        android.graphics.drawable.GradientDrawable base = new android.graphics.drawable.GradientDrawable(
+            android.graphics.drawable.GradientDrawable.Orientation.TL_BR,
+            new int[] { 0xff0d2238, 0xff141a2e, 0xff12121b } );
+        android.graphics.drawable.GradientDrawable glow = new android.graphics.drawable.GradientDrawable(
+            android.graphics.drawable.GradientDrawable.Orientation.TL_BR,
+            new int[] { 0x661a9fff, 0x221a9fff, 0x001a9fff } );
+        glow.setGradientType( android.graphics.drawable.GradientDrawable.RADIAL_GRADIENT );
+        glow.setGradientCenter( 0.75f, 0.3f );
+        glow.setGradientRadius( 1400 );
+        android.graphics.drawable.GradientDrawable glow2 = new android.graphics.drawable.GradientDrawable(
+            android.graphics.drawable.GradientDrawable.Orientation.TL_BR,
+            new int[] { 0x337a4dff, 0x007a4dff } );
+        glow2.setGradientType( android.graphics.drawable.GradientDrawable.RADIAL_GRADIENT );
+        glow2.setGradientCenter( 0.15f, 0.9f );
+        glow2.setGradientRadius( 1100 );
+        return new android.graphics.drawable.LayerDrawable(
+            new android.graphics.drawable.Drawable[] { base, glow, glow2 } );
     }
 
     private TopView top_view;
@@ -1538,23 +1774,48 @@ public class WineActivity extends Activity
     private float touchpad_x, touchpad_y, captured_dx, captured_dy;
     private float mouse_speed = 1.0f;
 
+    // A new window's thread has no cursor until it handles WM_SETCURSOR, so
+    // Wine reports a NULL cursor for a moment when e.g. a dialog opens under
+    // the mouse; only capture once the cursor stays hidden.
+    private static final int POINTER_CAPTURE_DELAY = 250;
+
+    private final Runnable request_pointer_capture = new Runnable() {
+        public void run()
+        {
+            if (!want_pointer_capture() || root_view.hasPointerCapture()) return;
+            Log.i( LOGTAG, "requesting pointer capture" );
+            root_view.requestPointerCapture();
+        }
+    };
+
+    private boolean want_pointer_capture()
+    {
+        return cursor_hidden && hasWindowFocus();
+    }
+
     private void update_pointer_capture()
     {
         if (root_view == null) return;
         mouse_speed = getSharedPreferences( PREFS_LAUNCHER, MODE_PRIVATE ).getFloat( PREF_MOUSE_SPEED, 1.0f );
-        if (cursor_hidden && hasWindowFocus())
+        root_view.removeCallbacks( request_pointer_capture );
+        if (want_pointer_capture())
         {
             if (!root_view.hasPointerCapture())
-            {
-                Log.i( LOGTAG, "requesting pointer capture" );
-                root_view.requestPointerCapture();
-            }
+                root_view.postDelayed( request_pointer_capture, POINTER_CAPTURE_DELAY );
         }
-        else if (root_view.hasPointerCapture())
+        else
         {
-            Log.i( LOGTAG, "releasing pointer capture" );
+            /* also when a request is still pending: hasPointerCapture() stays
+             * false until Android grants it, and the grant would stick */
+            if (root_view.hasPointerCapture()) Log.i( LOGTAG, "releasing pointer capture" );
             root_view.releasePointerCapture();
         }
+    }
+
+    private void pointer_capture_changed( boolean captured )
+    {
+        Log.i( LOGTAG, "pointer capture " + (captured ? "granted" : "lost") );
+        if (captured && !want_pointer_capture()) root_view.releasePointerCapture();
     }
 
     @Override
@@ -1671,6 +1932,7 @@ public class WineActivity extends Activity
     public void create_desktop_window( int hwnd )
     {
         Log.i( LOGTAG, String.format( "create desktop view %08x", hwnd ));
+        load_resolution();
         top_view = new TopView( this, hwnd );
         FrameLayout frame = new FrameLayout( this ) {
             @Override
@@ -1678,8 +1940,15 @@ public class WineActivity extends Activity
             {
                 return captured_pointer_event( event );
             }
+
+            @Override
+            public void onPointerCaptureChange( boolean captured )
+            {
+                pointer_capture_changed( captured );
+            }
         };
         root_view = frame;
+        frame.setBackgroundColor( 0xff000000 );  /* around a desktop that doesn't fill the window */
         frame.addView( top_view );
         Button kbd = new Button( this );
         kbd.setText( "\u2328" );
@@ -1693,7 +1962,7 @@ public class WineActivity extends Activity
         setContentView( frame );
         top_view.requestFocus();
         progress_dialog.dismiss();
-        wine_config_changed( getResources().getConfiguration().densityDpi );
+        wine_config_changed( desktop_dpi() );
     }
 
     public void create_window( int hwnd, boolean opengl, int parent, float scale, int pid )
@@ -1735,6 +2004,14 @@ public class WineActivity extends Activity
         if (bits != null)
         {
             Bitmap bitmap = Bitmap.createBitmap( bits, width, height, Bitmap.Config.ARGB_8888 );
+            /* the cursor is in Wine's pixels, which the desktop scale changes */
+            if (desktop_scale != 1 && Math.round( width * desktop_scale ) > 0 && Math.round( height * desktop_scale ) > 0)
+            {
+                bitmap = Bitmap.createScaledBitmap( bitmap, Math.round( width * desktop_scale ),
+                                                    Math.round( height * desktop_scale ), true );
+                hotspotx = Math.round( hotspotx * desktop_scale );
+                hotspoty = Math.round( hotspoty * desktop_scale );
+            }
             current_cursor = PointerIcon.create( bitmap, hotspotx, hotspoty );
         }
         else current_cursor = PointerIcon.getSystemIcon( this, id );
