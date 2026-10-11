@@ -1,0 +1,110 @@
+Subject: [PATCH] wineandroid.drv: Destroy the views of windows left by exited processes.
+
+A process that exits without destroying its windows (a killed program, or
+the console that start.exe gets) never sends the destroy ioctl, so the Java
+view kept showing the window's last frame, e.g. a black console frame next
+to the program the launcher started.
+
+Handle IRP_MJ_CLOSE, which the device gets when a process closes its handle,
+usually at exit, and destroy the views of all windows that no longer exist.
+---
+--- a/dlls/wineandroid.drv/android.h
++++ b/dlls/wineandroid.drv/android.h
+@@ -114,6 +114,7 @@
+ extern NTSTATUS android_java_init( void *arg );
+ extern NTSTATUS android_java_uninit( void *arg );
+ extern NTSTATUS android_register_window( void *arg );
++extern NTSTATUS android_dispatch_close( void *arg );
+ extern PNTAPCFUNC register_window_callback;
+ extern UINT64 start_device_callback;
+ 
+--- a/dlls/wineandroid.drv/device.c
++++ b/dlls/wineandroid.drv/device.c
+@@ -1167,6 +1167,32 @@
+     setCursor_ioctl,            /* IOCTL_SET_CURSOR */
+ };
+ 
++/* drop the Java views of windows that no longer exist; a process that exits
++ * without destroying its windows never sends the destroy ioctl for them, and
++ * their last frame would stay on screen */
++NTSTATUS android_dispatch_close( void *arg )
++{
++    static jmethodID method;
++    jobject object;
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(data_map); i++)
++    {
++        struct native_win_data *data = data_map[i];
++        HWND hwnd;
++
++        if (!data || NtUserIsWindow( data->hwnd )) continue;
++        hwnd = data->hwnd;
++        TRACE( "%p is gone, destroying its view\n", hwnd );
++        free_native_win_data( data );
++        if (!(object = load_java_method( &method, "destroyWindow", "(I)V" ))) continue;
++        wrap_java_call();
++        (*jni_env)->CallVoidMethod( jni_env, object, method, HandleToLong( hwnd ));
++        unwrap_java_call();
++    }
++    return STATUS_SUCCESS;
++}
++
+ NTSTATUS android_dispatch_ioctl( void *arg )
+ {
+     struct ioctl_params *params = arg;
+--- a/dlls/wineandroid.drv/dllmain.c
++++ b/dlls/wineandroid.drv/dllmain.c
+@@ -44,6 +44,16 @@
+     return status;
+ }
+ 
++/* a process closed the device, usually because it exited; windows it didn't
++ * destroy itself (killed processes, start.exe's console) are gone by now */
++static NTSTATUS WINAPI close_callback( DEVICE_OBJECT *device, IRP *irp )
++{
++    ANDROID_CALL( dispatch_close, NULL );
++    irp->IoStatus.Status = STATUS_SUCCESS;
++    IoCompleteRequest( irp, IO_NO_INCREMENT );
++    return STATUS_SUCCESS;
++}
++
+ static NTSTATUS CALLBACK init_android_driver( DRIVER_OBJECT *driver, UNICODE_STRING *name )
+ {
+     static const WCHAR device_nameW[] = {'\\','D','e','v','i','c','e','\\','W','i','n','e','A','n','d','r','o','i','d',0 };
+@@ -54,6 +64,7 @@
+     NTSTATUS status;
+ 
+     driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = ioctl_callback;
++    driver->MajorFunction[IRP_MJ_CLOSE] = close_callback;
+ 
+     RtlInitUnicodeString( &nameW, device_nameW );
+     RtlInitUnicodeString( &linkW, device_linkW );
+--- a/dlls/wineandroid.drv/init.c
++++ b/dlls/wineandroid.drv/init.c
+@@ -616,6 +616,7 @@
+     android_java_init,
+     android_java_uninit,
+     android_register_window,
++    android_dispatch_close,
+ };
+ 
+ 
+@@ -654,6 +655,7 @@
+     wow64_android_unsupported,  /* java_init */
+     wow64_android_unsupported,  /* java_uninit */
+     wow64_android_unsupported,  /* register_window */
++    wow64_android_unsupported,  /* dispatch_close */
+ };
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
+--- a/dlls/wineandroid.drv/unixlib.h
++++ b/dlls/wineandroid.drv/unixlib.h
+@@ -26,6 +26,7 @@
+     unix_java_init,
+     unix_java_uninit,
+     unix_register_window,
++    unix_dispatch_close,
+     unix_funcs_count
+ };
+ 
