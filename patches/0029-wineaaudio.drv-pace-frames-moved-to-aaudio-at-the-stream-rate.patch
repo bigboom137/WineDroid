@@ -1,0 +1,92 @@
+Subject: [PATCH] wineaaudio.drv: Pace frames moved to AAudio at the stream rate.
+
+Android's mixer takes whole bursts (40 ms on the deep-buffer output), and
+the timer loop handed the program's buffer over at that pace, so programs
+mixed 40 ms at once. Rhythm Doctor's audio engine (TempoStudio), which feeds
+Unity from its own 5 ms clock, then had only ~16 ms ready and the rest of
+every burst came out as silence: choppy, lower-pitched-sounding audio.
+
+Move frames at the stream's rate, one period ahead, like Windows' audio
+engine; the start silence covers Android's bursts.
+---
+--- a/dlls/wineaaudio.drv/aaudio.c
++++ b/dlls/wineaaudio.drv/aaudio.c
+@@ -47,7 +47,9 @@
+  * Frames count as played (no longer padding) once they are in the AAudio
+  * stream, which the timer loop keeps a few bursts ahead on its own: programs
+  * asking for small buffers (BASS: 10 ms) would otherwise never queue a whole
+- * burst, and Android's mixer would run dry on every one. */
++ * burst, and Android's mixer would run dry on every one. Frames leave the
++ * local buffer at the stream's rate, not in Android's bursts, see
++ * aaudio_write_data(). */
+ struct aaudio_stream
+ {
+     WAVEFORMATEX *fmt;
+@@ -62,6 +64,8 @@
+ 
+     BOOL playing, mute, please_quit;
+     UINT64 written_frames, last_pos_frames;
++    UINT64 moved_frames; /* frames moved to AAudio since paced_start */
++    LONGLONG paced_start; /* performance counter time the pacing counts from */
+     UINT32 period_frames, bufsize_frames, held_frames, tmp_buffer_frames;
+     UINT32 lcl_offs_frames; /* offs into local_buffer where valid data starts */
+     REFERENCE_TIME period;
+@@ -472,6 +476,7 @@
+         return aaudio_unlock_result(stream, &params->result, AUDCLNT_E_NOT_STOPPED);
+ 
+     if(stream->aa) write_start_silence(stream);
++    stream->paced_start = 0;
+     if(stream->aa && (res = AAudioStream_requestStart(stream->aa)) != AAUDIO_OK)
+         WARN("requestStart failed: %s\n", AAudio_convertResultToText(res));
+ 
+@@ -588,6 +593,34 @@
+     return res;
+ }
+ 
++/* How many frames may move to AAudio now. Android's mixer takes whole bursts
++ * (up to 40 ms on the deep-buffer output), and handing the program's buffer
++ * over at that pace made the program mix 40 ms at once: Rhythm Doctor's audio
++ * engine, which feeds Unity from its own 5 ms clock, then had only part of it
++ * ready and the rest came out as silence (choppy, "slowed" sound). Move frames
++ * at the stream's rate instead, one period ahead, like Windows' audio engine;
++ * the start silence covers Android's bursts. */
++static UINT32 paced_frames(struct aaudio_stream *stream)
++{
++    LARGE_INTEGER now;
++    INT64 due, max_credit = stream->bufsize_frames;
++
++    NtQueryPerformanceCounter(&now, NULL);
++    if(!stream->paced_start){
++        stream->paced_start = now.QuadPart;
++        stream->moved_frames = 0;
++    }
++    due = (now.QuadPart - stream->paced_start) * stream->fmt->nSamplesPerSec / 10000000
++          + stream->period_frames - stream->moved_frames;
++    /* the program fell behind (stall, nothing to play): don't let it catch
++     * up by more than a buffer, or the bursts come back */
++    if(due > max_credit){
++        stream->paced_start += (due - max_credit) * 10000000 / stream->fmt->nSamplesPerSec;
++        due = max_credit;
++    }
++    return due > 0 ? due : 0;
++}
++
+ static void aaudio_write_data(struct aaudio_stream *stream)
+ {
+     UINT32 queued, target, to_write, chunk, written;
+@@ -600,13 +633,14 @@
+     if(queued >= target)
+         return;
+ 
+-    to_write = min(target - queued, stream->held_frames);
++    to_write = min(min(target - queued, stream->held_frames), paced_frames(stream));
+     while(to_write){
+         chunk = min(to_write, stream->bufsize_frames - stream->lcl_offs_frames);
+         written = write_frames(stream, stream->local_buffer + stream->lcl_offs_frames * stream->fmt->nBlockAlign,
+                                chunk);
+         stream->lcl_offs_frames = (stream->lcl_offs_frames + written) % stream->bufsize_frames;
+         stream->held_frames -= written;
++        stream->moved_frames += written;
+         to_write -= written;
+         if(written < chunk)
+             break;  /* AAudio buffer full */
