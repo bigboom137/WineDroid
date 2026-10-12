@@ -1,0 +1,444 @@
+From: WineDroid
+Subject: [PATCH] wineandroid.drv: Share the clipboard text with Android.
+
+The Android driver had no clipboard support, so text copied in Windows
+programs couldn't be pasted in Android apps and the other way around.
+The driver now implements the clipboard manager window (in explorer, the
+desktop process that also runs the Java side): it puts CF_UNICODETEXT
+that programs copy into the Android clipboard, and takes the Android
+clipboard text into Wine when Java reports a change or the window gets
+focus (Android only lets the focused app read the clipboard). The text
+last exchanged is remembered so it doesn't bounce back.
+---
+--- a/dlls/wineandroid.drv/Makefile.in
++++ b/dlls/wineandroid.drv/Makefile.in
+@@ -5,6 +5,7 @@
+ 
+ SOURCES = \
+ 	build.gradle.in \
++	clipboard.c \
+ 	device.c \
+ 	dllmain.c \
+ 	init.c \
+--- a/dlls/wineandroid.drv/android.h
++++ b/dlls/wineandroid.drv/android.h
+@@ -79,6 +79,8 @@
+                                      UINT style, UINT flags, HWND after, HWND owner );
+ extern int ioctl_set_window_parent( HWND hwnd, HWND parent, float scale );
+ extern int ioctl_set_capture( HWND hwnd );
++extern int ioctl_get_clipboard( WCHAR **text, UINT *len );
++extern int ioctl_set_clipboard( const WCHAR *text, UINT len );
+ extern int ioctl_set_cursor( int id, int width, int height,
+                              int hotspotx, int hotspoty, const unsigned int *bits );
+ 
+@@ -149,6 +151,11 @@
+                                        jint dx, jint dy, jint state, jint vscroll, jint hscroll );
+ extern jboolean keyboard_event( JNIEnv *env, jobject obj, jint win, jint action,
+                                 jint keycode, jint state );
++extern void clipboard_changed( JNIEnv *env, jobject obj );
++
++/* clipboard */
++extern LRESULT ANDROID_ClipboardWindowProc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp );
++extern void android_clipboard_changed(void);
+ 
+ enum event_type
+ {
+@@ -157,6 +164,7 @@
+     SURFACE_CHANGED,
+     MOTION_EVENT,
+     KEYBOARD_EVENT,
++    CLIPBOARD_CHANGED,
+ };
+ 
+ union event_data
+--- /dev/null
++++ b/dlls/wineandroid.drv/clipboard.c
+@@ -0,0 +1,168 @@
++/*
++ * Android clipboard
++ *
++ * Copyright 2026 WineDroid
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <stdarg.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "winuser.h"
++
++#include "android.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(clipboard);
++
++/* Text is shared both ways through explorer's clipboard manager window,
++ * which runs in the desktop process like the Java side:
++ * - Java reports Android clipboard changes (and the window getting focus,
++ *   since Android only lets the focused app read the clipboard); the window
++ *   then takes the text and becomes the Wine clipboard owner.
++ * - Wine clipboard changes by programs reach the window as WM_CLIPBOARDUPDATE;
++ *   it sends their CF_UNICODETEXT to Java.
++ * The text last exchanged either way is kept to stop it from bouncing back. */
++
++static HWND clipboard_hwnd;
++static BOOL is_clipboard_owner;
++static WCHAR *last_text;
++static UINT last_len;
++
++static BOOL is_last_text( const WCHAR *text, UINT len )
++{
++    return last_text && len == last_len && !memcmp( text, last_text, len * sizeof(WCHAR) );
++}
++
++static void set_last_text( WCHAR *text, UINT len )
++{
++    free( last_text );
++    last_text = text;
++    last_len = len;
++}
++
++/* take the Android clipboard text into the Wine clipboard */
++static void grab_android_clipboard(void)
++{
++    struct set_clipboard_params params = { 0 };
++    WCHAR *text;
++    UINT len;
++
++    int ret;
++
++    if ((ret = ioctl_get_clipboard( &text, &len )))
++    {
++        WARN( "could not read the Android clipboard: %d\n", ret );
++        return;
++    }
++    if (!len || is_last_text( text, len ))
++    {
++        free( text );
++        return;
++    }
++
++    TRACE( "Android text %s\n", debugstr_wn( text, min( len, 64 )));
++
++    if (!NtUserOpenClipboard( clipboard_hwnd, 0 ))
++    {
++        free( text );
++        return;
++    }
++    NtUserEmptyClipboard();
++    is_clipboard_owner = TRUE;
++    params.data = text;
++    params.size = (len + 1) * sizeof(WCHAR);
++    NtUserSetClipboardData( CF_UNICODETEXT, 0, &params );
++    NtUserCloseClipboard();
++    set_last_text( text, len );
++}
++
++/* send the text a Windows program put in the clipboard to Android */
++static void export_wine_clipboard(void)
++{
++    struct get_clipboard_params params = { .data_only = TRUE, .size = 4096 };
++    WCHAR *text = NULL;
++    UINT len;
++
++    if (!NtUserOpenClipboard( clipboard_hwnd, 0 )) return;
++    for (;;)
++    {
++        if (!(params.data = malloc( params.size ))) break;
++        if (NtUserGetClipboardData( CF_UNICODETEXT, &params ))
++        {
++            text = params.data;
++            break;
++        }
++        free( params.data );
++        if (!params.data_size) break;
++        params.size = params.data_size;
++        params.data_size = 0;
++    }
++    NtUserCloseClipboard();
++    if (!text) return;  /* no text */
++
++    for (len = 0; len < params.size / sizeof(WCHAR) && text[len]; len++);
++    if (is_last_text( text, len ))
++    {
++        free( text );
++        return;
++    }
++
++    TRACE( "Windows text %s\n", debugstr_wn( text, min( len, 64 )));
++    ioctl_set_clipboard( text, len );
++    set_last_text( text, len );
++}
++
++/* called by the desktop thread when Java reports a clipboard change */
++void android_clipboard_changed(void)
++{
++    if (clipboard_hwnd) NtUserPostMessage( clipboard_hwnd, WM_USER, 0, 0 );
++}
++
++/**********************************************************************
++ *           ANDROID_ClipboardWindowProc
++ */
++LRESULT ANDROID_ClipboardWindowProc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
++{
++    switch (msg)
++    {
++    case WM_NCCREATE:
++        clipboard_hwnd = hwnd;
++        NtUserAddClipboardFormatListener( hwnd );
++        NtUserPostMessage( hwnd, WM_USER, 0, 0 );  /* the window may already have focus */
++        return TRUE;
++    case WM_CLIPBOARDUPDATE:
++        if (is_clipboard_owner) break;  /* ignore our own changes */
++        export_wine_clipboard();
++        break;
++    case WM_DESTROYCLIPBOARD:
++        is_clipboard_owner = FALSE;
++        break;
++    case WM_USER:
++        grab_android_clipboard();
++        break;
++    }
++    return NtUserMessageCall( hwnd, msg, wp, lp, NULL, NtUserDefWindowProc, FALSE );
++}
+--- a/dlls/wineandroid.drv/device.c
++++ b/dlls/wineandroid.drv/device.c
+@@ -66,6 +66,8 @@
+     IOCTL_SET_SWAP_INT,
+     IOCTL_SET_CAPTURE,
+     IOCTL_SET_CURSOR,
++    IOCTL_GET_CLIPBOARD,
++    IOCTL_SET_CLIPBOARD,
+     NB_IOCTLS
+ };
+ 
+@@ -308,6 +310,16 @@
+     return NULL;
+ }
+ 
++/* text in the Android clipboard (UTF-16), for both directions */
++struct ioctl_android_clipboard
++{
++    struct ioctl_header hdr;
++    UINT                size;     /* in bytes, without a terminating null */
++    WCHAR               text[1];
++};
++
++#define MAX_CLIPBOARD_SIZE (16 * 1024 * 1024)
++
+ static struct native_win_data *get_ioctl_native_win_data( const struct ioctl_header *hdr )
+ {
+     return get_native_win_data( LongToHandle(hdr->hwnd), hdr->opengl );
+@@ -1150,6 +1162,62 @@
+     return STATUS_SUCCESS;
+ }
+ 
++/* the size is always returned; the text only if it fits in the output buffer */
++static NTSTATUS getClipboard_ioctl( void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size )
++{
++    static jmethodID method;
++    struct ioctl_android_clipboard *res = data;
++    jobject object;
++    jstring str;
++    jsize len = 0;
++
++    if (out_size < offsetof( struct ioctl_android_clipboard, text )) return STATUS_BUFFER_TOO_SMALL;
++
++    if (!(object = load_java_method( &method, "getClipboardText", "()Ljava/lang/String;" )))
++        return STATUS_NOT_SUPPORTED;
++
++    wrap_java_call();
++    str = (*jni_env)->CallObjectMethod( jni_env, object, method );
++    if (str) len = (*jni_env)->GetStringLength( jni_env, str );
++    if (len > MAX_CLIPBOARD_SIZE / sizeof(WCHAR)) len = MAX_CLIPBOARD_SIZE / sizeof(WCHAR);
++    res->size = len * sizeof(WCHAR);
++    *ret_size = offsetof( struct ioctl_android_clipboard, text );
++    if (out_size >= offsetof( struct ioctl_android_clipboard, text ) + res->size)
++    {
++        if (len) (*jni_env)->GetStringRegion( jni_env, str, 0, len, (jchar *)res->text );
++        *ret_size += res->size;
++    }
++    if (str) (*jni_env)->DeleteLocalRef( jni_env, str );
++    unwrap_java_call();
++
++    TRACE( "%u bytes\n", res->size );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS setClipboard_ioctl( void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size )
++{
++    static jmethodID method;
++    struct ioctl_android_clipboard *res = data;
++    jobject object;
++    jstring str;
++
++    if (in_size < offsetof( struct ioctl_android_clipboard, text )) return STATUS_INVALID_PARAMETER;
++    if (res->size > in_size - offsetof( struct ioctl_android_clipboard, text ) || res->size % sizeof(WCHAR))
++        return STATUS_INVALID_PARAMETER;
++
++    TRACE( "%u bytes\n", res->size );
++
++    if (!(object = load_java_method( &method, "setClipboardText", "(Ljava/lang/String;)V" )))
++        return STATUS_NOT_SUPPORTED;
++
++    wrap_java_call();
++    str = (*jni_env)->NewString( jni_env, (const jchar *)res->text, res->size / sizeof(WCHAR) );
++    (*jni_env)->CallVoidMethod( jni_env, object, method, str );
++    (*jni_env)->DeleteLocalRef( jni_env, str );
++    unwrap_java_call();
++    return STATUS_SUCCESS;
++}
++
+ typedef NTSTATUS (*ioctl_func)( void *in, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size );
+ static const ioctl_func ioctl_funcs[] =
+ {
+@@ -1165,6 +1233,8 @@
+     setSwapInterval_ioctl,      /* IOCTL_SET_SWAP_INT */
+     setCapture_ioctl,           /* IOCTL_SET_CAPTURE */
+     setCursor_ioctl,            /* IOCTL_SET_CURSOR */
++    getClipboard_ioctl,         /* IOCTL_GET_CLIPBOARD */
++    setClipboard_ioctl,         /* IOCTL_SET_CLIPBOARD */
+ };
+ 
+ /* drop the Java views of windows that no longer exist; a process that exits
+@@ -1831,3 +1901,65 @@
+     free( req );
+     return ret;
+ }
++
++/* the caller frees *text; *len is in characters, the text is null-terminated */
++int ioctl_get_clipboard( WCHAR **text, UINT *len )
++{
++    struct ioctl_android_clipboard *req;
++    DWORD size = offsetof( struct ioctl_android_clipboard, text[16384] );
++    int i, ret = -ENOMEM;
++
++    for (i = 0; i < 3; i++)
++    {
++        /* output buffers have to be Wine-managed memory, not the Unix heap */
++        SIZE_T alloc_size = size;
++        DWORD out_size = size;
++
++        req = NULL;
++        if (NtAllocateVirtualMemory( GetCurrentProcess(), (void **)&req, 0, &alloc_size,
++                                     MEM_COMMIT, PAGE_READWRITE ))
++            return -ENOMEM;
++        req->hdr.hwnd = 0;
++        req->hdr.opengl = FALSE;
++        req->size = 0;
++        ret = android_ioctl( IOCTL_GET_CLIPBOARD, req, sizeof(*req), req, &out_size );
++        if (!ret && out_size == offsetof( struct ioctl_android_clipboard, text ) + req->size)
++        {
++            *len = req->size / sizeof(WCHAR);
++            if ((*text = malloc( req->size + sizeof(WCHAR) )))
++            {
++                memcpy( *text, req->text, req->size );
++                (*text)[*len] = 0;
++            }
++            else ret = -ENOMEM;
++        }
++        else if (!ret)
++        {
++            /* the text didn't fit, or changed in between */
++            size = offsetof( struct ioctl_android_clipboard, text ) + req->size;
++            ret = -EAGAIN;
++        }
++        alloc_size = 0;
++        NtFreeVirtualMemory( GetCurrentProcess(), (void **)&req, &alloc_size, MEM_RELEASE );
++        if (ret != -EAGAIN) break;
++    }
++    return ret;
++}
++
++int ioctl_set_clipboard( const WCHAR *text, UINT len )
++{
++    struct ioctl_android_clipboard *req;
++    unsigned int size;
++    int ret;
++
++    if (len > MAX_CLIPBOARD_SIZE / sizeof(WCHAR)) len = MAX_CLIPBOARD_SIZE / sizeof(WCHAR);
++    size = offsetof( struct ioctl_android_clipboard, text[len] );
++    if (!(req = malloc( size ))) return -ENOMEM;
++    req->hdr.hwnd = 0;
++    req->hdr.opengl = FALSE;
++    req->size = len * sizeof(WCHAR);
++    memcpy( req->text, text, req->size );
++    ret = android_ioctl( IOCTL_SET_CLIPBOARD, req, size, NULL, NULL );
++    free( req );
++    return ret;
++}
+--- a/dlls/wineandroid.drv/init.c
++++ b/dlls/wineandroid.drv/init.c
+@@ -365,6 +365,7 @@
+     .pWindowPosChanged = ANDROID_WindowPosChanged,
+     .pOpenGLInit = ANDROID_OpenGLInit,
+     .pVulkanInit = ANDROID_VulkanInit,
++    .pClipboardWindowProc = ANDROID_ClipboardWindowProc,
+ };
+ 
+ 
+@@ -376,6 +377,7 @@
+     { "wine_motion_event", "(IIIIIII)Z", motion_event },
+     { "wine_relative_motion_event", "(IIIIII)Z", relative_motion_event },
+     { "wine_keyboard_event", "(IIII)Z", keyboard_event },
++    { "wine_clipboard_changed", "()V", clipboard_changed },
+ };
+ 
+ #define DECL_FUNCPTR(f) typeof(f) * p##f = NULL
+--- a/dlls/wineandroid.drv/window.c
++++ b/dlls/wineandroid.drv/window.c
+@@ -228,6 +228,21 @@
+ 
+ 
+ /***********************************************************************
++ *           clipboard_changed
++ *
++ * JNI callback, runs in the context of the Java thread.
++ */
++void clipboard_changed( JNIEnv *env, jobject obj )
++{
++    union event_data data;
++
++    memset( &data, 0, sizeof(data) );
++    data.type = CLIPBOARD_CHANGED;
++    send_event( &data );
++}
++
++
++/***********************************************************************
+  *           surface_changed
+  *
+  * JNI callback, runs in the context of the Java thread.
+@@ -576,6 +591,11 @@
+             set_screen_dpi( event->data.cfg.dpi );
+             break;
+ 
++        case CLIPBOARD_CHANGED:
++            TRACE( "CLIPBOARD_CHANGED\n" );
++            android_clipboard_changed();
++            break;
++
+         case SURFACE_CHANGED:
+             TRACE("SURFACE_CHANGED %p %p %s size %ux%u\n", event->data.surface.hwnd,
+                   event->data.surface.window, event->data.surface.client ? "client" : "whole",

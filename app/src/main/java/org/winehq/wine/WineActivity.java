@@ -23,6 +23,8 @@ package org.winehq.wine;
 import android.annotation.TargetApi;
 import android.app.Activity;
 import android.app.ProgressDialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -88,6 +90,7 @@ public class WineActivity extends Activity
     public native boolean wine_relative_motion_event( int action, int dx, int dy, int state,
                                                       int vscroll, int hscroll );
     public native boolean wine_keyboard_event( int hwnd, int action, int keycode, int state );
+    public native void wine_clipboard_changed();
 
     private final String LOGTAG = "wine";
     private ProgressDialog progress_dialog;
@@ -103,6 +106,7 @@ public class WineActivity extends Activity
         super.onCreate( savedInstanceState );
 
         requestWindowFeature( android.view.Window.FEATURE_NO_TITLE );
+        init_clipboard();
 
         final String cmdline = getIntent().getStringExtra( EXTRA_CMDLINE );
         if (wine_env != null)
@@ -1899,6 +1903,65 @@ public class WineActivity extends Activity
     {
         super.onWindowFocusChanged( has_focus );
         update_pointer_capture();  // Android drops the capture when the window loses focus
+        /* Android only lets the focused app read the clipboard, so pick up what
+         * other apps copied while we were in the background */
+        if (has_focus) clipboard_changed();
+    }
+
+    /* clipboard shared with Android (text only); the driver's clipboard window
+     * keeps Wine's clipboard in sync through getClipboardText/setClipboardText */
+
+    private ClipboardManager clipboard;
+
+    private void init_clipboard()
+    {
+        clipboard = (ClipboardManager)getSystemService( Context.CLIPBOARD_SERVICE );
+        if (clipboard == null) return;
+        clipboard.addPrimaryClipChangedListener( new ClipboardManager.OnPrimaryClipChangedListener() {
+            public void onPrimaryClipChanged() { clipboard_changed(); }} );
+    }
+
+    private void clipboard_changed()
+    {
+        if (desktop_window != null) wine_clipboard_changed();  /* natives are registered */
+    }
+
+    /* called by the driver's device thread */
+    public String getClipboardText()
+    {
+        try
+        {
+            ClipData clip = clipboard != null ? clipboard.getPrimaryClip() : null;
+            if (clip == null || clip.getItemCount() == 0)
+            {
+                Log.i( LOGTAG, "clipboard: nothing to read (focus " + hasWindowFocus() + ")" );
+                return null;
+            }
+            CharSequence text = clip.getItemAt( 0 ).coerceToText( this );
+            Log.i( LOGTAG, "clipboard: " + (text != null ? text.length() : 0) + " characters to Wine" );
+            return text != null ? text.toString() : null;
+        }
+        catch (Exception e)
+        {
+            Log.w( LOGTAG, "could not read the clipboard: " + e );
+            return null;
+        }
+    }
+
+    public void setClipboardText( final String text )
+    {
+        runOnUiThread( new Runnable() { public void run()
+        {
+            try
+            {
+                Log.i( LOGTAG, "clipboard: " + text.length() + " characters from Wine" );
+                if (clipboard != null) clipboard.setPrimaryClip( ClipData.newPlainText( "Wine", text ));
+            }
+            catch (Exception e)
+            {
+                Log.w( LOGTAG, "could not set the clipboard: " + e );
+            }
+        }} );
     }
 
     private boolean captured_pointer_event( MotionEvent event )
