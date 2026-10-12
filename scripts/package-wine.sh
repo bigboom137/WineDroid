@@ -7,6 +7,8 @@
 # Set MONO_DIR to an unpacked wine-mono release (wine-mono-<version>, the one
 # dlls/mscoree expects) to bundle it; .NET programs (XNA/FNA games such as
 # Celeste) need it.
+# Set POWERSHELL_DIR to an unpacked PowerShell 7 release (PowerShell-<version>-win-x64.zip)
+# to bundle it; Wine's powershell.exe runs it (patch 0038).
 # Set LIBERATION_DIR to the unpacked liberation-fonts-ttf release to add Arial,
 # Times New Roman and Courier New built from it (needs fontTools, e.g. on
 # PYTHONPATH).
@@ -57,6 +59,13 @@ if [ -n "$MONO_DIR" ]; then
     echo "Adding Wine Mono from $MONO_DIR"
     mkdir -p "$ASSETS/share/wine/mono"
     cp -a "$MONO_DIR" "$ASSETS/share/wine/mono/"
+fi
+
+# PowerShell 7; WineActivity links C:\Program Files\PowerShell\7 to it
+if [ -n "$POWERSHELL_DIR" ]; then
+    echo "Adding PowerShell from $POWERSHELL_DIR"
+    mkdir -p "$ASSETS/share/powershell"
+    cp -a "$POWERSHELL_DIR/." "$ASSETS/share/powershell/"
 fi
 
 # Fonts that wine.inf registers and Windows programs expect (WineActivity

@@ -1,0 +1,178 @@
+From: WineDroid
+Subject: [PATCH] powershell: Run PowerShell 7 when it is installed.
+
+Wine's powershell.exe is a stub that does nothing and exits with 0, so
+programs that shell out to PowerShell (VS Code's Python extension
+installing uv, for example) silently did nothing. When
+%ProgramFiles%\PowerShell\7\pwsh.exe exists, powershell.exe now runs it
+with the same arguments, adding -Command before a bare command (which
+pwsh would take for a script file) and dropping -Version/-PSConsoleFile,
+and returns its exit code. It sets DOTNET_SYSTEM_GLOBALIZATION_USENLS so
+.NET uses Wine's NLS functions instead of the missing ICU.
+---
+--- a/programs/powershell/main.c
++++ b/programs/powershell/main.c
+@@ -16,14 +16,163 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++#include <windows.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <ctype.h>
++#include <wctype.h>
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(powershell);
+ 
++/* PowerShell 7 (pwsh.exe) takes nearly the same command line as Windows
++ * PowerShell, so when it is installed, powershell.exe runs it instead */
++static BOOL find_pwsh( WCHAR *path, DWORD size )
++{
++    static const WCHAR *vars[] = { L"ProgramW6432", L"ProgramFiles" };
++    unsigned int i;
++    DWORD len;
++
++    for (i = 0; i < ARRAY_SIZE(vars); i++)
++    {
++        len = GetEnvironmentVariableW( vars[i], path, size );
++        if (!len || len >= size) continue;
++        if (len + wcslen( L"\\PowerShell\\7\\pwsh.exe" ) >= size) continue;
++        wcscat( path, L"\\PowerShell\\7\\pwsh.exe" );
++        if (GetFileAttributesW( path ) != INVALID_FILE_ATTRIBUTES) return TRUE;
++    }
++    return FALSE;
++}
++
++/* whether arg is an abbreviation of name, at least min characters long */
++static BOOL is_param( const WCHAR *arg, const WCHAR *name, size_t min )
++{
++    size_t len = wcslen( arg );
++    return len >= min && len <= wcslen( name ) && !wcsnicmp( arg, name, len );
++}
++
++/* append arg to cmdline, quoted the way CommandLineToArgvW splits it */
++static WCHAR *append_arg( WCHAR *p, const WCHAR *arg )
++{
++    unsigned int backslashes;
++
++    if (*arg && !wcspbrk( arg, L" \t\"" ))
++    {
++        *p++ = ' ';
++        wcscpy( p, arg );
++        return p + wcslen( arg );
++    }
++
++    *p++ = ' ';
++    *p++ = '"';
++    for (;;)
++    {
++        for (backslashes = 0; *arg == '\\'; arg++) backslashes++;
++        if (!*arg)
++        {
++            /* double the backslashes before the closing quote */
++            while (backslashes--) { *p++ = '\\'; *p++ = '\\'; }
++            break;
++        }
++        if (*arg == '"')
++        {
++            while (backslashes--) { *p++ = '\\'; *p++ = '\\'; }
++            *p++ = '\\';
++        }
++        else while (backslashes--) *p++ = '\\';
++        *p++ = *arg++;
++    }
++    *p++ = '"';
++    *p = 0;
++    return p;
++}
++
++static int run_pwsh( const WCHAR *pwsh, int argc, WCHAR *argv[] )
++{
++    PROCESS_INFORMATION pi;
++    STARTUPINFOW si = { sizeof(si) };
++    WCHAR *cmdline, *p;
++    BOOL rest = FALSE;
++    DWORD exit_code;
++    size_t size;
++    int i;
++
++    size = wcslen( pwsh ) + 16;
++    for (i = 1; i < argc; i++) size += 2 * wcslen( argv[i] ) + 4;
++    if (!(cmdline = malloc( size * sizeof(WCHAR) ))) return 1;
++
++    p = cmdline;
++    *p++ = '"';
++    wcscpy( p, pwsh );
++    p += wcslen( pwsh );
++    *p++ = '"';
++    *p = 0;
++
++    for (i = 1; i < argc; i++)
++    {
++        const WCHAR *name = argv[i] + 1;
++
++        if (rest || argv[i][0] != '-' || !iswalpha( name[0] ))
++        {
++            /* Windows PowerShell runs a bare command, pwsh would take it for -File */
++            if (!rest && argv[i][0] != '-') p = append_arg( p, L"-Command" );
++            rest = TRUE;
++        }
++        else if (is_param( name, L"command", 1 ) || is_param( name, L"file", 1 ) ||
++                 (is_param( name, L"encodedcommand", 1 ) && !is_param( name, L"executionpolicy", 2 )) ||
++                 !wcsicmp( name, L"ec" ))
++        {
++            rest = TRUE;
++        }
++        else if (is_param( name, L"version", 1 ) || is_param( name, L"psconsolefile", 3 ))
++        {
++            /* pwsh has no -Version <version> or -PSConsoleFile */
++            WINE_TRACE( "ignoring %s\n", wine_dbgstr_w(argv[i]) );
++            i++;
++            continue;
++        }
++        else if (is_param( name, L"executionpolicy", 2 ) || !wcsicmp( name, L"ep" ) ||
++                 is_param( name, L"inputformat", 1 ) || !wcsicmp( name, L"if" ) ||
++                 is_param( name, L"outputformat", 1 ) || !wcsicmp( name, L"of" ) ||
++                 is_param( name, L"windowstyle", 1 ) || is_param( name, L"configurationname", 3 ))
++        {
++            p = append_arg( p, argv[i] );
++            if (++i == argc) break;
++        }
++        p = append_arg( p, argv[i] );
++    }
++
++    WINE_TRACE( "running %s\n", wine_dbgstr_w(cmdline) );
++
++    /* .NET can't load ICU (Wine's icu.dll forwards to icuuc68.dll, which
++     * isn't there), but Wine implements the NLS functions it can use instead */
++    if (!GetEnvironmentVariableW( L"DOTNET_SYSTEM_GLOBALIZATION_USENLS", NULL, 0 ))
++        SetEnvironmentVariableW( L"DOTNET_SYSTEM_GLOBALIZATION_USENLS", L"1" );
++
++    if (!CreateProcessW( pwsh, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi ))
++    {
++        WINE_ERR( "failed to run %s: %lu\n", wine_dbgstr_w(cmdline), GetLastError() );
++        free( cmdline );
++        return 1;
++    }
++    free( cmdline );
++
++    /* pwsh shares our console and handles Ctrl+C itself */
++    SetConsoleCtrlHandler( NULL, TRUE );
++    CloseHandle( pi.hThread );
++    WaitForSingleObject( pi.hProcess, INFINITE );
++    if (!GetExitCodeProcess( pi.hProcess, &exit_code )) exit_code = 1;
++    CloseHandle( pi.hProcess );
++    return exit_code;
++}
++
+ int __cdecl wmain(int argc, WCHAR *argv[])
+ {
++    WCHAR pwsh[MAX_PATH];
+     int i;
+ 
++    if (find_pwsh( pwsh, ARRAY_SIZE(pwsh) )) return run_pwsh( pwsh, argc, argv );
++
+     WINE_FIXME("stub.\n");
+     for (i = 0; i < argc; i++)
+     {

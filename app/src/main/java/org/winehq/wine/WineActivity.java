@@ -309,6 +309,51 @@ public class WineActivity extends Activity
             if (src.getName().endsWith( ".ttf" )) installFile( src, new File( dest_dir, src.getName() ));
     }
 
+    /* point C:\Program Files\PowerShell\7, where Wine's powershell.exe looks for
+     * PowerShell 7, at the runtime's copy with a symlink: PowerShell is 250 MB and
+     * Android doesn't let apps make hard links */
+    private void installPowerShell( File prefix )
+    {
+        File src = new File( getRuntimeDir(), "share/powershell" );
+        File dest = new File( prefix, "drive_c/Program Files/PowerShell/7" );
+        if (!src.isDirectory()) return;
+        try
+        {
+            if (Os.readlink( dest.getPath() ).equals( src.getPath() )) return;
+        }
+        catch (Exception e) {}
+        deleteTree( dest );
+        dest.getParentFile().mkdirs();
+        try
+        {
+            Os.symlink( src.getPath(), dest.getPath() );
+        }
+        catch (Exception e)
+        {
+            Log.w( LOGTAG, "could not link " + dest + ": " + e );
+        }
+    }
+
+    /* delete a file or directory, without following symlinks */
+    private static void deleteTree( File file )
+    {
+        try
+        {
+            if (android.system.OsConstants.S_ISLNK( Os.lstat( file.getPath() ).st_mode ))
+            {
+                file.delete();
+                return;
+            }
+        }
+        catch (Exception e)
+        {
+            return;  /* doesn't exist */
+        }
+        File[] files = file.listFiles();
+        if (files != null) for (File f : files) deleteTree( f );
+        file.delete();
+    }
+
     @TargetApi(21)
     @SuppressWarnings("deprecation")
     private String[] get_supported_abis()
@@ -445,6 +490,10 @@ public class WineActivity extends Activity
         createStorageDrive( prefix );
         if (installDxvk( prefix )) env.put( "WINEDLLOVERRIDES", "d3d8,d3d9,d3d10core,d3d11,dxgi=n,b" );
         if (RUNTIME_PROTON.equals( wine_runtime )) installFonts( prefix );
+        installPowerShell( prefix );
+        /* .NET can't load ICU in Wine (icu.dll forwards to a missing icuuc68.dll);
+         * Wine's NLS functions work */
+        env.put( "DOTNET_SYSTEM_GLOBALIZATION_USENLS", "1" );
         wine_env = env;
 
         runWine( cmdline, env );

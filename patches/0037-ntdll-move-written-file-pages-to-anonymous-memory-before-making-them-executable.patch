@@ -1,0 +1,65 @@
+From: WineDroid
+Subject: [PATCH] ntdll: Move written file pages to anonymous memory before making them executable on Android.
+
+Android's SELinux policy denies apps execmod, so mprotect(PROT_EXEC) fails
+with EACCES on a private file mapping that has been written to. .NET maps
+its ReadyToRun images, makes the code writable to apply relocations and
+then executable again; the failure went unnoticed and PowerShell 7 died
+of a stack overflow of execute faults in System.Private.CoreLib. Such
+pages are now copied into anonymous memory, which can be made executable.
+---
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -1919,6 +1919,35 @@ static NTSTATUS get_vprot_flags( DWORD protect, unsigned int *vprot, BOOL image
+ }
+ 
+ 
++#ifdef __ANDROID__
++/***********************************************************************
++ *           mprotect_anon
++ *
++ * Android's SELinux policy denies apps execmod: a private file mapping
++ * that has been written to (relocated image pages, or .NET applying its
++ * own relocations after making the code writable) can't be made
++ * executable again. Move such pages into anonymous memory, which can.
++ */
++static int mprotect_anon( void *base, size_t size, int unix_prot )
++{
++    void *copy;
++
++    if (mprotect( base, size, PROT_READ )) return -1;
++    if ((copy = mmap( NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0 )) == MAP_FAILED)
++        return -1;
++    memcpy( copy, base, size );
++    if (mmap( base, size, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0 ) == MAP_FAILED)
++    {
++        munmap( copy, size );
++        return -1;
++    }
++    memcpy( base, copy, size );
++    munmap( copy, size );
++    TRACE( "moved %p-%p to anonymous memory\n", base, (char *)base + size - 1 );
++    return mprotect( base, size, unix_prot );
++}
++#endif
++
+ /***********************************************************************
+  *           mprotect_exec
+  *
+@@ -1934,7 +1963,16 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
+         if (!(unix_prot & PROT_WRITE)) return -1;
+     }
+ 
++#ifdef __ANDROID__
++    if (mprotect( base, size, unix_prot ))
++    {
++        if (errno != EACCES || !(unix_prot & PROT_EXEC)) return -1;
++        return mprotect_anon( base, size, unix_prot );
++    }
++    return 0;
++#else
+     return mprotect( base, size, unix_prot );
++#endif
+ }
+ 
+ 
