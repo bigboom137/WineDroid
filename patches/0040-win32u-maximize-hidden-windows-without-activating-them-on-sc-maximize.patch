@@ -1,0 +1,62 @@
+From: WineDroid
+Subject: [PATCH] win32u: Maximize hidden windows without activating them on SC_MAXIMIZE.
+
+Chrome crashed at startup whenever its last window was maximized: its
+Widget::Init maximizes the still hidden browser window with
+WM_SYSCOMMAND SC_MAXIMIZE, and DefWindowProc showed and activated it.
+BrowserView::OnWidgetActivationChanged then ran before the browser
+window features existed and dereferenced a null
+ExtensionKeybindingRegistryViews. Chrome expects the window to stay
+hidden until its own Show() call (which checks IsMaximized()), so
+maximize hidden windows the way CreateWindow handles WS_MAXIMIZE:
+change the state and size with SWP_NOACTIVATE and leave them hidden.
+---
+diff --git a/dlls/win32u/defwnd.c b/dlls/win32u/defwnd.c
+index 9404a87..78cafbd 100644
+--- a/dlls/win32u/defwnd.c
++++ b/dlls/win32u/defwnd.c
+@@ -1020,7 +1020,19 @@ static LRESULT handle_sys_command( HWND hwnd, WPARAM wparam, LPARAM lparam )
+ 
+     case SC_MAXIMIZE:
+         if (is_iconic(hwnd)) NtUserShowOwnedPopups( hwnd, TRUE );
+-        NtUserShowWindow( hwnd, SW_MAXIMIZE );
++        if (!(get_window_long( hwnd, GWL_STYLE ) & WS_VISIBLE))
++        {
++            /* Maximize hidden windows without showing or activating them, like
++             * CreateWindow does for WS_MAXIMIZE. Chrome maximizes its browser
++             * window while creating it and crashes if it is activated before
++             * it shows the window itself. */
++            RECT rect;
++            UINT swp = window_min_maximize( hwnd, SW_MAXIMIZE, &rect );
++            NtUserSetWindowPos( hwnd, 0, rect.left, rect.top, rect.right - rect.left,
++                                rect.bottom - rect.top,
++                                swp | SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER );
++        }
++        else NtUserShowWindow( hwnd, SW_MAXIMIZE );
+         break;
+ 
+     case SC_CLOSE:
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index dbc2d33..9eef8e9 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -291,6 +291,7 @@ extern HWND is_current_process_window( HWND hwnd );
+ extern HWND is_current_thread_window( HWND hwnd );
+ extern BOOL is_desktop_window( HWND hwnd );
+ extern BOOL is_iconic( HWND hwnd );
++extern UINT window_min_maximize( HWND hwnd, UINT cmd, RECT *rect );
+ extern BOOL is_window_drawable( HWND hwnd, BOOL icon );
+ extern BOOL is_window_enabled( HWND hwnd );
+ extern BOOL is_window_unicode( HWND hwnd );
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -4602,7 +4607,7 @@ static POINT get_minimized_pos( HWND hwnd, POINT pt )
+ /***********************************************************************
+  *           window_min_maximize
+  */
+-static UINT window_min_maximize( HWND hwnd, UINT cmd, RECT *rect )
++UINT window_min_maximize( HWND hwnd, UINT cmd, RECT *rect )
+ {
+     UINT swp_flags = 0;
+     DWORD old_style;
