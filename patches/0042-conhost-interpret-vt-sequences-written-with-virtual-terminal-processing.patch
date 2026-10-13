@@ -1,0 +1,439 @@
+From: WineDroid
+Subject: [PATCH] conhost: Interpret VT sequences written with ENABLE_VIRTUAL_TERMINAL_PROCESSING.
+
+conhost stored VT sequences in the screen buffer as text: ESC [ 3 3 m
+took five cells and moved the cursor five columns. Its tty output then
+redrew those cells, so the sequences mostly reached the terminal, but the
+cursor and line wrapping were wrong, and programs that read the cursor
+position back saw nonsense. In VS Code's terminal (a pseudo console),
+PowerShell's PSReadLine and Python's REPL typed over the prompt, moved
+back dozens of columns and had lines wrapped in the middle of sequences
+("m9;49m" left of ESC[39;49m).
+
+Interpret the sequences into the screen buffer: SGR colors (16, 256 and
+RGB colors mapped to the console palette, bold, underline, reverse),
+cursor movement and positioning, erase in display/line, erase, insert and
+delete characters, insert/delete lines and scrolling, save/restore cursor,
+cursor visibility and cursor position reports. OSC sequences (window
+title, VS Code shell integration marks) are passed through to the tty
+after the text written before them. Sequences split over several writes
+are kept per screen buffer. A newline honors DISABLE_NEWLINE_AUTO_RETURN
+in VT mode, as on Windows.
+---
+diff --git a/programs/conhost/conhost.c b/programs/conhost/conhost.c
+--- a/programs/conhost/conhost.c
++++ b/programs/conhost/conhost.c
+@@ -2103,6 +2103,376 @@ static NTSTATUS set_output_info( struct screen_buffer *screen_buffer,
+     return STATUS_SUCCESS;
+ }
+ 
++/* VT sequences written with ENABLE_VIRTUAL_TERMINAL_PROCESSING are interpreted
++ * into the screen buffer, so that the buffer, the cursor position programs read
++ * back and our own tty output stay right; storing them as text made PSReadLine
++ * and Python's REPL wrap in the middle of sequences and type at the wrong place */
++
++static void vt_touch( RECT *update_rect, int left, int top, int right, int bottom )
++{
++    update_rect->left   = min( update_rect->left,   left );
++    update_rect->top    = min( update_rect->top,    top );
++    update_rect->right  = max( update_rect->right,  right );
++    update_rect->bottom = max( update_rect->bottom, bottom );
++}
++
++static void vt_fill( struct screen_buffer *screen_buffer, unsigned int x, unsigned int y,
++                     unsigned int count, RECT *update_rect )
++{
++    char_info_t *ch = &screen_buffer->data[y * screen_buffer->width + x];
++    unsigned int i;
++
++    count = min( count, screen_buffer->width - x );
++    if (!count) return;
++    for (i = 0; i < count; i++)
++    {
++        ch[i].ch   = ' ';
++        ch[i].attr = screen_buffer->attr;
++    }
++    vt_touch( update_rect, x, y, x + count - 1, y );
++}
++
++/* move lines [top, bottom] of the window by count (> 0 down, < 0 up), blanking the freed lines */
++static void vt_scroll( struct screen_buffer *screen_buffer, int top, int bottom, int count, RECT *update_rect )
++{
++    unsigned int width = screen_buffer->width;
++    int lines = bottom - top + 1, y;
++
++    if (lines <= 0 || !count) return;
++    if (abs( count ) > lines) count = count > 0 ? lines : -lines;
++    if (count > 0)
++        memmove( &screen_buffer->data[(top + count) * width], &screen_buffer->data[top * width],
++                 (lines - count) * width * sizeof(*screen_buffer->data) );
++    else
++        memmove( &screen_buffer->data[top * width], &screen_buffer->data[(top - count) * width],
++                 (lines + count) * width * sizeof(*screen_buffer->data) );
++    for (y = 0; y < abs( count ); y++)
++        vt_fill( screen_buffer, 0, count > 0 ? top + y : bottom - y, width, update_rect );
++    vt_touch( update_rect, 0, top, width - 1, bottom );
++}
++
++/* closest console color of an xterm 256 color index or of an RGB value */
++static unsigned int vt_rgb_color( unsigned int r, unsigned int g, unsigned int b )
++{
++    unsigned int max = max( r, max( g, b ) ), color = 0;
++
++    if (max < 0x40) return 0;
++    if (r * 2 > max) color |= FOREGROUND_RED;
++    if (g * 2 > max) color |= FOREGROUND_GREEN;
++    if (b * 2 > max) color |= FOREGROUND_BLUE;
++    if (max > 0xc0) color |= FOREGROUND_INTENSITY;
++    if (color == FOREGROUND_INTENSITY) color = 7;  /* light gray, not dark gray */
++    return color;
++}
++
++static unsigned int vt_ansi_color( unsigned int n )
++{
++    return ((n & 1) ? FOREGROUND_RED : 0) | ((n & 2) ? FOREGROUND_GREEN : 0) | ((n & 4) ? FOREGROUND_BLUE : 0) |
++           ((n & 8) ? FOREGROUND_INTENSITY : 0);
++}
++
++static unsigned int vt_256_color( unsigned int n )
++{
++    static const unsigned char levels[6] = { 0, 0x5f, 0x87, 0xaf, 0xd7, 0xff };
++
++    if (n < 16) return vt_ansi_color( n );
++    if (n < 232)
++    {
++        n -= 16;
++        return vt_rgb_color( levels[n / 36], levels[(n / 6) % 6], levels[n % 6] );
++    }
++    n = 8 + (n - 232) * 10;  /* gray ramp */
++    if (n < 0x40) return 0;
++    if (n < 0x90) return FOREGROUND_INTENSITY;
++    if (n < 0xd0) return 7;
++    return 15;
++}
++
++static void vt_sgr( struct screen_buffer *screen_buffer, const unsigned int *params, unsigned int count )
++{
++    unsigned int attr = screen_buffer->attr, i, color;
++
++    if (!count) attr = empty_char_info.attr;
++    for (i = 0; i < count; i++)
++    {
++        unsigned int n = params[i];
++
++        if (n == 0) attr = empty_char_info.attr;
++        else if (n == 1) attr |= FOREGROUND_INTENSITY;
++        else if (n == 2 || n == 22) attr &= ~FOREGROUND_INTENSITY;
++        else if (n == 4) attr |= COMMON_LVB_UNDERSCORE;
++        else if (n == 24) attr &= ~COMMON_LVB_UNDERSCORE;
++        else if (n == 7) attr |= COMMON_LVB_REVERSE_VIDEO;
++        else if (n == 27) attr &= ~COMMON_LVB_REVERSE_VIDEO;
++        else if (n >= 30 && n <= 37) attr = (attr & ~7) | vt_ansi_color( n - 30 );
++        else if (n == 39) attr = (attr & ~7) | (empty_char_info.attr & 7);
++        else if (n >= 40 && n <= 47) attr = (attr & ~0x70) | (vt_ansi_color( n - 40 ) << 4);
++        else if (n == 49) attr = (attr & ~0xf0) | (empty_char_info.attr & 0xf0);
++        else if (n >= 90 && n <= 97) attr = (attr & ~0x0f) | vt_ansi_color( n - 90 + 8 );
++        else if (n >= 100 && n <= 107) attr = (attr & ~0xf0) | (vt_ansi_color( n - 100 + 8 ) << 4);
++        else if ((n == 38 || n == 48) && i + 1 < count)
++        {
++            if (params[i + 1] == 5 && i + 2 < count)
++            {
++                color = vt_256_color( params[i + 2] );
++                i += 2;
++            }
++            else if (params[i + 1] == 2 && i + 4 < count)
++            {
++                color = vt_rgb_color( params[i + 2], params[i + 3], params[i + 4] );
++                i += 4;
++            }
++            else break;
++            if (n == 38) attr = (attr & ~0x0f) | color;
++            else attr = (attr & ~0xf0) | (color << 4);
++        }
++    }
++    screen_buffer->attr = attr;
++}
++
++/* answer a cursor position report through the input, as Windows does */
++static void vt_report_cursor( struct screen_buffer *screen_buffer )
++{
++    INPUT_RECORD records[32];
++    char buf[32];
++    unsigned int i, len;
++
++    len = sprintf( buf, "\x1b[%u;%uR", (unsigned int)(screen_buffer->cursor_y - screen_buffer->win.top + 1),
++                   get_bounded_cursor_x( screen_buffer ) + 1 );
++    memset( records, 0, sizeof(records) );
++    for (i = 0; i < len; i++)
++    {
++        records[i].EventType = KEY_EVENT;
++        records[i].Event.KeyEvent.bKeyDown = TRUE;
++        records[i].Event.KeyEvent.wRepeatCount = 1;
++        records[i].Event.KeyEvent.uChar.UnicodeChar = buf[i];
++    }
++    write_console_input( screen_buffer->console, records, len, TRUE );
++}
++
++static void vt_csi( struct screen_buffer *screen_buffer, RECT *update_rect )
++{
++    const char *seq = screen_buffer->vt_seq + 2, *end = screen_buffer->vt_seq + screen_buffer->vt_len - 1;
++    char final = *end, private = 0;
++    unsigned int params[16], count = 0, n, n1, x, y, i;
++    int top = screen_buffer->win.top, bottom = screen_buffer->win.bottom;
++
++    TRACE( "%s\n", debugstr_an( screen_buffer->vt_seq + 1, screen_buffer->vt_len - 1 ));
++
++    if (*seq == '?' || *seq == '>' || *seq == '<' || *seq == '=') private = *seq++;
++    params[0] = 0;
++    for (; seq < end; seq++)
++    {
++        if (*seq >= '0' && *seq <= '9')
++        {
++            if (!count) count = 1;
++            params[count - 1] = params[count - 1] * 10 + *seq - '0';
++        }
++        else if (*seq == ';' || *seq == ':')
++        {
++            if (!count) count = 1;
++            if (count == ARRAY_SIZE(params)) break;
++            params[count++] = 0;
++        }
++        else return;  /* intermediate bytes (cursor style and such), not supported */
++    }
++    n = count && params[0] ? params[0] : 1;
++    n1 = count > 1 && params[1] ? params[1] : 1;
++    if (bottom >= screen_buffer->height) bottom = screen_buffer->height - 1;
++    x = get_bounded_cursor_x( screen_buffer );
++    y = screen_buffer->cursor_y;
++
++    if (private)
++    {
++        if (private == '?' && (final == 'h' || final == 'l'))
++            for (i = 0; i < count; i++)
++                if (params[i] == 25) screen_buffer->cursor_visible = final == 'h';
++        return;
++    }
++
++    switch (final)
++    {
++    case 'A': y = max( (int)y - (int)n, top ); break;
++    case 'B': y = min( y + n, bottom ); break;
++    case 'C': x = min( x + n, screen_buffer->width - 1 ); break;
++    case 'D': x = n > x ? 0 : x - n; break;
++    case 'E': y = min( y + n, bottom ); x = 0; break;
++    case 'F': y = max( (int)y - (int)n, top ); x = 0; break;
++    case 'G': case '`': x = min( n - 1, screen_buffer->width - 1 ); break;
++    case 'd': y = min( top + n - 1, bottom ); break;
++    case 'H': case 'f':
++        y = min( top + n - 1, bottom );
++        x = min( n1 - 1, screen_buffer->width - 1 );
++        break;
++    case 'J':
++        switch (count ? params[0] : 0)
++        {
++        case 0:
++            vt_fill( screen_buffer, x, y, screen_buffer->width, update_rect );
++            for (i = y + 1; i <= bottom; i++) vt_fill( screen_buffer, 0, i, screen_buffer->width, update_rect );
++            break;
++        case 1:
++            for (i = top; i < y; i++) vt_fill( screen_buffer, 0, i, screen_buffer->width, update_rect );
++            vt_fill( screen_buffer, 0, y, x + 1, update_rect );
++            break;
++        case 2:
++            for (i = top; i <= bottom; i++) vt_fill( screen_buffer, 0, i, screen_buffer->width, update_rect );
++            break;
++        }
++        break;
++    case 'K':
++        switch (count ? params[0] : 0)
++        {
++        case 0: vt_fill( screen_buffer, x, y, screen_buffer->width, update_rect ); break;
++        case 1: vt_fill( screen_buffer, 0, y, x + 1, update_rect ); break;
++        case 2: vt_fill( screen_buffer, 0, y, screen_buffer->width, update_rect ); break;
++        }
++        break;
++    case 'X':
++        vt_fill( screen_buffer, x, y, n, update_rect );
++        break;
++    case 'P':  /* delete characters */
++    case '@':  /* insert blanks */
++    {
++        char_info_t *line = &screen_buffer->data[y * screen_buffer->width];
++        unsigned int rest = screen_buffer->width - x;
++
++        n = min( n, rest );
++        if (final == 'P')
++        {
++            memmove( line + x, line + x + n, (rest - n) * sizeof(*line) );
++            vt_fill( screen_buffer, screen_buffer->width - n, y, n, update_rect );
++        }
++        else
++        {
++            memmove( line + x + n, line + x, (rest - n) * sizeof(*line) );
++            vt_fill( screen_buffer, x, y, n, update_rect );
++        }
++        vt_touch( update_rect, x, y, screen_buffer->width - 1, y );
++        break;
++    }
++    case 'L': vt_scroll( screen_buffer, y, bottom, n, update_rect ); x = 0; break;
++    case 'M': vt_scroll( screen_buffer, y, bottom, -(int)n, update_rect ); x = 0; break;
++    case 'S': vt_scroll( screen_buffer, top, bottom, -(int)n, update_rect ); break;
++    case 'T': vt_scroll( screen_buffer, top, bottom, n, update_rect ); break;
++    case 'm': vt_sgr( screen_buffer, params, count ); break;
++    case 's': screen_buffer->vt_saved_x = x; screen_buffer->vt_saved_y = y; break;
++    case 'u':
++        x = min( screen_buffer->vt_saved_x, screen_buffer->width - 1 );
++        y = min( screen_buffer->vt_saved_y, screen_buffer->height - 1 );
++        break;
++    case 'n':
++        if (count && params[0] == 6) vt_report_cursor( screen_buffer );
++        break;
++    default:  /* scroll margins, window ops, device attributes: ignored */
++        break;
++    }
++    screen_buffer->cursor_x = x;
++    screen_buffer->cursor_y = y;
++}
++
++static void vt_tty_write( struct screen_buffer *screen_buffer, const char *buffer, size_t size )
++{
++    if (is_active( screen_buffer )) tty_write( screen_buffer->console, buffer, size );
++}
++
++/* returns TRUE if ch was part of an escape sequence */
++static BOOL vt_process_char( struct screen_buffer *screen_buffer, WCHAR ch, RECT *update_rect )
++{
++    char *seq = screen_buffer->vt_seq;
++
++    if (!screen_buffer->vt_len)
++    {
++        if (ch != 0x1b) return FALSE;
++        seq[screen_buffer->vt_len++] = 0x1b;
++        return TRUE;
++    }
++
++    if (screen_buffer->vt_len >= 2 && seq[1] == ']')
++    {
++        /* OSC (title, VS Code shell integration marks): passed through, until BEL or ST */
++        if (ch == 0x07)
++        {
++            vt_tty_write( screen_buffer, "\x07", 1 );
++            screen_buffer->vt_len = 0;
++        }
++        else if (ch == 0x1b)
++        {
++            vt_tty_write( screen_buffer, "\x1b\\", 2 );
++            screen_buffer->vt_len = 1;  /* ESC \ ends it, anything else starts a new sequence */
++        }
++        else
++        {
++            char buf[8];
++            int size = WideCharToMultiByte( get_tty_cp( screen_buffer->console ), 0, &ch, 1,
++                                            buf, sizeof(buf), NULL, NULL );
++            vt_tty_write( screen_buffer, buf, size );
++        }
++        return TRUE;
++    }
++
++    if (ch == 0x1b && screen_buffer->vt_len > 1)  /* a new sequence interrupts this one */
++    {
++        screen_buffer->vt_len = 1;
++        return TRUE;
++    }
++
++    if (ch > 0x7e)  /* not a sequence after all */
++    {
++        screen_buffer->vt_len = 0;
++        return FALSE;
++    }
++    seq[screen_buffer->vt_len++] = ch;
++
++    if (screen_buffer->vt_len == 2)
++    {
++        unsigned int x = get_bounded_cursor_x( screen_buffer );
++
++        switch (ch)
++        {
++        case ']':
++            /* what was written before the OSC goes out first, and its marks apply at the cursor */
++            if (is_active( screen_buffer ) && screen_buffer->console->tty_output)
++            {
++                update_output( screen_buffer, update_rect );
++                set_tty_cursor( screen_buffer->console, x, screen_buffer->cursor_y );
++                tty_write( screen_buffer->console, "\x1b]", 2 );
++            }
++            return TRUE;
++        case '[': case '(': case ')': case '*': case '+':
++            return TRUE;
++        case '7':
++            screen_buffer->vt_saved_x = x;
++            screen_buffer->vt_saved_y = screen_buffer->cursor_y;
++            break;
++        case '8':
++            screen_buffer->cursor_x = min( screen_buffer->vt_saved_x, screen_buffer->width - 1 );
++            screen_buffer->cursor_y = min( screen_buffer->vt_saved_y, screen_buffer->height - 1 );
++            break;
++        case 'M':  /* reverse index */
++            if (screen_buffer->cursor_y > screen_buffer->win.top) screen_buffer->cursor_y--;
++            else vt_scroll( screen_buffer, screen_buffer->win.top,
++                            min( screen_buffer->win.bottom, (int)screen_buffer->height - 1 ), 1, update_rect );
++            break;
++        }
++        screen_buffer->vt_len = 0;  /* other two character sequences are ignored */
++        return TRUE;
++    }
++
++    if (seq[1] != '[')  /* character set designation */
++    {
++        screen_buffer->vt_len = 0;
++        return TRUE;
++    }
++    if (ch >= 0x40 && ch <= 0x7e)
++    {
++        vt_csi( screen_buffer, update_rect );
++        screen_buffer->vt_len = 0;
++    }
++    else if (screen_buffer->vt_len == sizeof(screen_buffer->vt_seq)) screen_buffer->vt_len = 0;
++    return TRUE;
++}
++
+ static NTSTATUS write_console( struct screen_buffer *screen_buffer, const WCHAR *buffer, size_t len )
+ {
+     RECT update_rect;
+@@ -2114,6 +2484,9 @@ static NTSTATUS write_console( struct screen_buffer *screen_buffer, const WCHAR
+ 
+     for (i = 0; i < len; i++)
+     {
++        if ((screen_buffer->mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) &&
++            vt_process_char( screen_buffer, buffer[i], &update_rect ))
++            continue;
+         if (screen_buffer->mode & ENABLE_PROCESSED_OUTPUT)
+         {
+             switch (buffer[i])
+@@ -2128,7 +2501,11 @@ static NTSTATUS write_console( struct screen_buffer *screen_buffer, const WCHAR
+                 while (j--) write_char( screen_buffer, ' ', &update_rect, NULL );
+                 continue;
+             case '\n':
+-                screen_buffer->cursor_x = 0;
++                if ((screen_buffer->mode & (ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN)) ==
++                    (ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN))
++                    screen_buffer->cursor_x = get_bounded_cursor_x( screen_buffer );
++                else
++                    screen_buffer->cursor_x = 0;
+                 if (++screen_buffer->cursor_y == screen_buffer->height)
+                     new_line( screen_buffer, &update_rect );
+                 else if (screen_buffer->mode & ENABLE_WRAP_AT_EOL_OUTPUT)
+diff --git a/programs/conhost/conhost.h b/programs/conhost/conhost.h
+--- a/programs/conhost/conhost.h
++++ b/programs/conhost/conhost.h
+@@ -132,6 +132,10 @@ struct screen_buffer
+     unsigned int           color_map[16];       /* color table */
+     RECT                   win;                 /* current visible window on the screen buffer */
+     struct font_info       font;                /* console font information */
++    unsigned int           vt_len;              /* length of the pending VT escape sequence */
++    char                   vt_seq[64];          /* pending VT escape sequence */
++    unsigned int           vt_saved_x;          /* cursor saved by ESC 7 / CSI s */
++    unsigned int           vt_saved_y;
+     struct wine_rb_entry   entry;               /* map entry */
+ };
+ 

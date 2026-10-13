@@ -1,0 +1,23 @@
+From: WineDroid
+Subject: [PATCH] wine.inf: Make the Android driver the default graphics driver.
+
+The desktop that WineActivity starts gets the android driver on
+explorer's command line, but explorer picks the driver of any other
+desktop from HKCU\Software\Wine\Drivers\Graphics, which was unset, so it
+fell back to "mac,x11,wayland". Chromium's sandbox (Chrome, VS Code and
+other Electron apps) starts its renderers on a desktop of their own, and
+the explorer for that desktop got no working driver: the renderers never
+got going and VS Code webviews such as the Claude Code panel stayed
+blank. Default to android; 0x2 keeps a value the user set.
+---
+diff --git a/loader/wine.inf.in b/loader/wine.inf.in
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -558,6 +558,7 @@ HKLM,%MciExtStr%,"wvx",,"MPEGVideo"
+ 
+ [Misc]
+ HKCU,Software\Wine\DllOverrides,"conpty",0x2,"builtin"
++HKCU,Software\Wine\Drivers,"Graphics",0x2,"android"
+ HKLM,Software\Borland\Database Engine\Settings\SYSTEM\INIT,SHAREDMEMLOCATION,,9000
+ HKLM,Software\Clients,,16
+ HKLM,Software\Clients\Mail,,2,"Native Mail Client"
