@@ -137,6 +137,11 @@ public class WineActivity extends Activity
     /* launcher setting: Windows UI scale in percent (100 = 96 DPI), 0 to match
      * Android's own scale */
     public static final String PREF_UI_SCALE = "ui_scale";
+    /* launcher settings for Steam games (Proton): the resolution they render at in percent
+     * of the screen (100 = the screen's), FSR or bilinear upscaling, DXVK's HUD */
+    public static final String PREF_GAME_SCALE = "game_scale";
+    public static final String PREF_GAME_FSR = "game_fsr";
+    public static final String PREF_GAME_HUD = "game_hud";
     public static final String WALLPAPER_FILE = "wallpaper";
     /* Wine build to run, the name of its directory in the assets */
     public static final String EXTRA_RUNTIME = "org.winehq.wine.RUNTIME";
@@ -468,6 +473,13 @@ public class WineActivity extends Activity
              * which Android doesn't have; the Windows Steam client needs its own, or Steam
              * says "There was a problem with your Steam installation" */
             env.put( "PROTON_DISABLE_LSTEAMCLIENT", "1" );
+            /* user32 switches Steam games to this emulated mode, win32u's fullscreen hack
+             * scales them up to the window */
+            SharedPreferences prefs = getSharedPreferences( PREFS_LAUNCHER, MODE_PRIVATE );
+            int game_scale = prefs.getInt( PREF_GAME_SCALE, 100 );
+            if (game_scale < 100) env.put( "WINEDROID_GAME_SCALE", Integer.toString( game_scale ));
+            if (prefs.getBoolean( PREF_GAME_FSR, true )) env.put( "WINE_FULLSCREEN_FSR", "1" );
+            if (prefs.getBoolean( PREF_GAME_HUD, false )) env.put( "WINEDROID_GAME_HUD", "fps,frametimes,gpuload" );
         }
 
         if (cmdline == null)

@@ -202,6 +202,24 @@ public class LauncherActivity extends Activity
         settings_page.addView( wallpaper_row );
         updateDisplaySettings();
 
+        settings_page.addView( Ui.section( this, "Games" ));
+        game_scale_row = settingRow( "Game resolution", "", new View.OnClickListener() {
+            public void onClick( View v ) { gameScaleDialog(); }} );
+        settings_page.addView( game_scale_row );
+        game_fsr_row = settingRow( "Upscaling", "", new View.OnClickListener() {
+            public void onClick( View v ) { togglePref( WineActivity.PREF_GAME_FSR, true ); }} );
+        settings_page.addView( game_fsr_row );
+        game_hud_row = settingRow( "Performance overlay", "", new View.OnClickListener() {
+            public void onClick( View v ) { togglePref( WineActivity.PREF_GAME_HUD, false ); }} );
+        settings_page.addView( game_hud_row );
+        TextView games_hint = Ui.text( this, "For Steam games with the Proton runtime. A lower game resolution renders "
+                                       + "fewer pixels and is scaled up to the window; Steam and the desktop stay sharp. "
+                                       + "The overlay shows frame rate, frame times and GPU load.", 12,
+                                       Ui.TEXT_SECONDARY, false );
+        games_hint.setPadding( dp( 4 ), dp( 8 ), dp( 4 ), 0 );
+        settings_page.addView( games_hint );
+        updateDisplaySettings();
+
         settings_page.addView( Ui.section( this, "Input" ));
         settings_page.addView( mouseSpeedSetting() );
 
@@ -427,7 +445,8 @@ public class LauncherActivity extends Activity
         "2560x1600", "1920x1200", "1920x1080", "1680x1050", "1600x900", "1440x900",
         "1366x768", "1280x800", "1280x720", "1024x768", "800x600" };
 
-    private View resolution_row, wallpaper_row;
+    private View resolution_row, wallpaper_row, game_scale_row, game_fsr_row, game_hud_row;
+    private static final int[] GAME_SCALES = { 100, 75, 67, 50 };
 
     private View settingRow( String title, String value, View.OnClickListener l )
     {
@@ -457,6 +476,55 @@ public class LauncherActivity extends Activity
         ((TextView)wallpaper_row.findViewWithTag( "value" )).setText(
             WineActivity.WALLPAPER_CUSTOM.equals( wp ) ? "Your image" :
             WineActivity.WALLPAPER_NONE.equals( wp ) ? "Plain color" : "WineDroid" );
+        if (game_scale_row == null) return;
+        int scale = prefs.getInt( WineActivity.PREF_GAME_SCALE, 100 );
+        ((TextView)game_scale_row.findViewWithTag( "value" )).setText( scale >= 100 ? "Full" : scale + "%" );
+        ((TextView)game_fsr_row.findViewWithTag( "value" )).setText(
+            prefs.getBoolean( WineActivity.PREF_GAME_FSR, true ) ? "FSR (sharp)" : "Bilinear (smooth)" );
+        ((TextView)game_hud_row.findViewWithTag( "value" )).setText(
+            prefs.getBoolean( WineActivity.PREF_GAME_HUD, false ) ? "On" : "Off" );
+    }
+
+    private void togglePref( String key, boolean def )
+    {
+        SharedPreferences prefs = getSharedPreferences( PREFS, MODE_PRIVATE );
+        prefs.edit().putBoolean( key, !prefs.getBoolean( key, def )).apply();
+        displaySettingChanged();
+    }
+
+    /* the size games render at, a percentage of Wine's screen size */
+    private void gameScaleDialog()
+    {
+        android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+        int w = Math.max( dm.widthPixels, dm.heightPixels ), h = Math.min( dm.widthPixels, dm.heightPixels );
+        String res = getSharedPreferences( PREFS, MODE_PRIVATE ).getString( WineActivity.PREF_RESOLUTION, "" );
+        String[] parts = res.split( "x" );
+        if (parts.length == 2)
+        {
+            try { w = Integer.parseInt( parts[0] ); h = Integer.parseInt( parts[1] ); }
+            catch (NumberFormatException e) {}
+        }
+        final String[] items = new String[GAME_SCALES.length];
+        int cur = getSharedPreferences( PREFS, MODE_PRIVATE ).getInt( WineActivity.PREF_GAME_SCALE, 100 ), checked = 0;
+        for (int i = 0; i < GAME_SCALES.length; i++)
+        {
+            int s = GAME_SCALES[i];
+            items[i] = s == 100 ? "Full (same as the screen)"
+                                : s + "% (about " + (w * s / 200 * 2) + " × " + (h * s / 200 * 2) + ")";
+            if (s == cur) checked = i;
+        }
+        new AlertDialog.Builder( this )
+            .setTitle( "Game resolution" )
+            .setSingleChoiceItems( items, checked, new DialogInterface.OnClickListener() {
+                public void onClick( DialogInterface d, int which )
+                {
+                    d.dismiss();
+                    getSharedPreferences( PREFS, MODE_PRIVATE ).edit()
+                        .putInt( WineActivity.PREF_GAME_SCALE, GAME_SCALES[which] ).apply();
+                    displaySettingChanged();
+                }} )
+            .setNegativeButton( android.R.string.cancel, null )
+            .show();
     }
 
     /* settings only apply when Wine starts */

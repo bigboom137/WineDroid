@@ -1,0 +1,91 @@
+From: WineDroid
+Subject: [PATCH] user32, win32u: Render Steam games at a lower resolution on Android.
+
+Games on the Googlebook's Intel GPU are GPU-bound at the native
+2880x1800 (Dave the Diver ran at ~8 fps). WINEDROID_GAME_SCALE (set
+by the launcher's "Game resolution" setting) is a percentage of the
+screen size. win32u adds display modes with the screen's aspect ratio
+at 75, 67, 50 percent and that percentage, and user32 switches
+processes with SteamGameId set to that mode with CDS_FULLSCREEN, so
+explorer restores the mode when the game exits; the fullscreen hack
+scales the game up to the window. Steam and the desktop stay at full
+resolution. WINEDROID_GAME_HUD sets DXVK_HUD in the same processes.
+
+--- a/dlls/user32/user_main.c
++++ b/dlls/user32/user_main.c
+@@ -202,6 +202,38 @@
+ /***********************************************************************
+  *           USER initialisation routine
+  */
++/* WineDroid: Steam games (SteamGameId set) render at WINEDROID_GAME_SCALE percent of the
++ * screen, an emulated mode that win32u's fullscreen hack scales up to the Android window;
++ * CDS_FULLSCREEN makes explorer restore the mode when the game exits. WINEDROID_GAME_HUD
++ * turns on DXVK's HUD in them. Runs before the game's code asks for the screen size. */
++static void init_winedroid_game(void)
++{
++    DEVMODEW mode = {.dmSize = sizeof(mode)}, largest = {.dmSize = sizeof(mode)}, current = {.dmSize = sizeof(mode)};
++    WCHAR buf[64];
++    DWORD i, scale;
++
++    if (!GetEnvironmentVariableW( L"SteamGameId", buf, ARRAY_SIZE(buf) ) || !wcscmp( buf, L"0" )) return;
++    if (GetEnvironmentVariableW( L"WINEDROID_GAME_HUD", buf, ARRAY_SIZE(buf) ) && buf[0])
++        SetEnvironmentVariableW( L"DXVK_HUD", buf );
++
++    if (!GetEnvironmentVariableW( L"WINEDROID_GAME_SCALE", buf, ARRAY_SIZE(buf) )) return;
++    scale = wcstoul( buf, NULL, 10 );
++    if (scale < 25 || scale >= 100) return;
++    if (!EnumDisplaySettingsW( NULL, ENUM_CURRENT_SETTINGS, &current )) return;
++    for (i = 0; EnumDisplaySettingsW( NULL, i, &mode ); i++)
++        if (mode.dmPelsWidth * mode.dmPelsHeight > largest.dmPelsWidth * largest.dmPelsHeight) largest = mode;
++    /* already switched, by another process of the game or the game itself */
++    if (current.dmPelsWidth != largest.dmPelsWidth || current.dmPelsHeight != largest.dmPelsHeight) return;
++
++    mode = current;
++    mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
++    mode.dmPelsWidth = largest.dmPelsWidth * scale / 200 * 2;
++    mode.dmPelsHeight = largest.dmPelsHeight * scale / 200 * 2;
++    TRACE( "switching game to %lux%lu\n", mode.dmPelsWidth, mode.dmPelsHeight );
++    if (ChangeDisplaySettingsExW( NULL, &mode, NULL, CDS_FULLSCREEN, NULL ))
++        WARN( "failed to switch to %lux%lu\n", mode.dmPelsWidth, mode.dmPelsHeight );
++}
++
+ static BOOL process_attach(void)
+ {
+     NtCurrentTeb()->Peb->KernelCallbackTable = kernel_callback_table;
+@@ -209,6 +241,7 @@
+ 
+     winproc_init();
+     SYSPARAMS_Init();
++    init_winedroid_game();
+     return TRUE;
+ }
+ 
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -2193,9 +2193,26 @@
+     const char *env;
+ 
+     count = 1 + ARRAY_SIZE(default_sizes) + ARRAY_SIZE(lowres_sizes) + modes_count;
++#ifdef __ANDROID__
++    count += 4;
++#endif
+     if (!(sizes = malloc( count * sizeof(*sizes) ))) return NULL;
+ 
+     count = add_screen_size( sizes, 0, max_size );
++#ifdef __ANDROID__
++    {
++        /* the Android window's own shape scaled down, for games to render at a lower resolution
++         * that fills the window: user32 switches Steam games to WINEDROID_GAME_SCALE percent */
++        UINT scales[] = {75, 67, 50, 0};
++        if ((env = getenv( "WINEDROID_GAME_SCALE" ))) scales[3] = atoi( env );
++        for (i = 0; i < ARRAY_SIZE(scales); i++)
++        {
++            SIZE size = {.cx = max_size.cx * scales[i] / 200 * 2, .cy = max_size.cy * scales[i] / 200 * 2};
++            if (scales[i] < 25 || scales[i] >= 100 || size.cx < 640 || size.cy < 360) continue;
++            count += add_screen_size( sizes, count, size );
++        }
++    }
++#endif
+     for (i = 0; i < ARRAY_SIZE(default_sizes); i++)
+     {
+         if (default_sizes[i].cx > max_size.cx || default_sizes[i].cy > max_size.cy) continue;
