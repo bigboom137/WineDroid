@@ -1,0 +1,153 @@
+From: WineDroid
+Subject: [PATCH] explorer: Switch between the taskbar's windows with Alt+`.
+
+Android keeps Alt+Tab and Alt+Shift+Tab for its own task switching, so
+they never reach Wine, and Wine has no window switcher of its own. With a
+fullscreen window in front the taskbar is hidden as well, which left no
+way to get to another window.
+
+The taskbar registers Alt+` and Alt+Shift+` hotkeys. A press activates
+the next (previous) taskbar window in most-recently-used order; pressing
+` again while Alt is held goes on through the same list, like Alt+Tab.
+Minimized windows are restored. The window switched away from is
+minimized if it covers the whole screen, since a fullscreen window stays
+in front otherwise (topmost, or its client surface above the others on
+Android).
+
+--- a/programs/explorer/systray.c
++++ b/programs/explorer/systray.c
+@@ -135,6 +135,10 @@
+ #define TASKBAR_FIELD   RGB(45, 48, 57)
+ 
+ #define CLOCK_TIMER 100
++#define SWITCH_TIMER 101
++
++#define HOTKEY_SWITCH_NEXT 1
++#define HOTKEY_SWITCH_PREV 2
+ 
+ static struct icon *balloon_icon;
+ static HWND balloon_window;
+@@ -1290,6 +1294,98 @@
+     SetForegroundWindow( hwnd );
+ }
+ 
++/* Alt+` / Alt+Shift+` switch between the taskbar's windows, like Alt+Tab: Android keeps
++ * Alt+Tab for its own tasks, and a fullscreen window hides the taskbar. Pressing ` again
++ * while Alt is held goes on to the next window, in the order they were used. */
++static HWND switch_list[64];
++static int switch_count, switch_index;
++static BOOL switching, switch_key_up;
++
++static BOOL covers_screen( HWND hwnd )
++{
++    MONITORINFO info = { .cbSize = sizeof(info) };
++    RECT rect;
++
++    if (!GetWindowRect( hwnd, &rect )) return FALSE;
++    if (!GetMonitorInfoW( MonitorFromWindow( hwnd, MONITOR_DEFAULTTONEAREST ), &info )) return FALSE;
++    return rect.left <= info.rcMonitor.left && rect.top <= info.rcMonitor.top &&
++           rect.right >= info.rcMonitor.right && rect.bottom >= info.rcMonitor.bottom;
++}
++
++/* the taskbar's windows, most recently used (topmost) first */
++static void get_switch_windows(void)
++{
++    HWND hwnd;
++
++    switch_count = 0;
++    for (hwnd = GetWindow( GetDesktopWindow(), GW_CHILD );
++         hwnd && switch_count < ARRAY_SIZE(switch_list);
++         hwnd = GetWindow( hwnd, GW_HWNDNEXT ))
++    {
++        if (!find_taskbar_button( hwnd )) continue;
++        if (!IsWindowVisible( hwnd ) || GetWindow( hwnd, GW_OWNER )) continue;
++        switch_list[switch_count++] = hwnd;
++    }
++}
++
++static void switch_to_window( HWND hwnd )
++{
++    HWND prev = GetAncestor( GetForegroundWindow(), GA_ROOTOWNER ), owned;
++
++    if (IsIconic( hwnd ))
++        SendMessageTimeoutW( hwnd, WM_SYSCOMMAND, SC_RESTORE, 0, SMTO_ABORTIFHUNG, 2000, NULL );
++    if (!IsWindowEnabled( hwnd ))  /* a modal dialog owned by it gets the focus */
++    {
++        for (owned = GetWindow( GetDesktopWindow(), GW_CHILD ); owned; owned = GetWindow( owned, GW_HWNDNEXT ))
++            if (GetWindow( owned, GW_OWNER ) == hwnd && IsWindowVisible( owned ) && IsWindowEnabled( owned ))
++                break;
++        if (owned) hwnd = owned;
++    }
++    SetForegroundWindow( hwnd );
++
++    /* a fullscreen window would stay in front (topmost, or its own Android surface above
++     * the other windows), so it gets minimized like a fullscreen game on Windows */
++    if (prev && prev != hwnd && find_taskbar_button( prev ) && !IsIconic( prev ) && covers_screen( prev ))
++        PostMessageW( prev, WM_SYSCOMMAND, SC_MINIMIZE, 0 );
++}
++
++static void handle_switch_hotkey( int id )
++{
++    HWND foreground;
++    int i;
++
++    if (switching && !switch_key_up) return;  /* key repeat */
++
++    if (!switching)
++    {
++        get_switch_windows();
++        foreground = GetAncestor( GetForegroundWindow(), GA_ROOTOWNER );
++        switch_index = -1;
++        for (i = 0; i < switch_count; i++) if (switch_list[i] == foreground) switch_index = i;
++        /* none of them in front: Alt+` goes to the last used one, Alt+Shift+` to the oldest */
++        if (switch_index == -1 && id == HOTKEY_SWITCH_PREV) switch_index = 0;
++        switching = TRUE;
++        SetTimer( tray_window, SWITCH_TIMER, 50, NULL );
++    }
++    switch_key_up = FALSE;
++
++    for (i = 0; i < switch_count; i++)
++    {
++        if (id == HOTKEY_SWITCH_PREV) switch_index = (switch_index + switch_count - 1) % switch_count;
++        else switch_index = (switch_index + 1) % switch_count;
++        if (IsWindow( switch_list[switch_index] )) break;
++    }
++    if (i < switch_count) switch_to_window( switch_list[switch_index] );
++}
++
++static void switch_timer(void)
++{
++    if (!(GetAsyncKeyState( VK_OEM_3 ) & 0x8000)) switch_key_up = TRUE;
++    if (GetAsyncKeyState( VK_MENU ) & 0x8000) return;
++    switching = FALSE;
++    KillTimer( tray_window, SWITCH_TIMER );
++}
++
+ static void show_taskbar_contextmenu( HWND button, LPARAM lparam )
+ {
+     ULONG_PTR id = GetWindowLongPtrW( button, GWLP_ID );
+@@ -1423,6 +1519,11 @@
+ 
+     case WM_TIMER:
+         if (wparam == CLOCK_TIMER) update_clock( TRUE );
++        if (wparam == SWITCH_TIMER) switch_timer();
++        break;
++
++    case WM_HOTKEY:
++        handle_switch_hotkey( wparam );
+         break;
+ 
+     case WM_COMMAND:
+@@ -1556,6 +1657,11 @@
+ 
+     add_taskbar_button( 0 );
+ 
+-    if (enable_taskbar) do_show_systray();
++    if (enable_taskbar)
++    {
++        RegisterHotKey( tray_window, HOTKEY_SWITCH_NEXT, MOD_ALT, VK_OEM_3 );
++        RegisterHotKey( tray_window, HOTKEY_SWITCH_PREV, MOD_ALT | MOD_SHIFT, VK_OEM_3 );
++        do_show_systray();
++    }
+     else do_hide_systray();
+ }

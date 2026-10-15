@@ -1,0 +1,21 @@
+From: WineDroid
+Subject: [PATCH] server: Let the owner of a hotkey set the foreground window.
+
+A process may only set the foreground window when its last input is newer
+than the foreground thread's. A hotkey press goes to the hotkey's owner
+as WM_HOTKEY instead of input, so the owner never qualified, and
+explorer's Alt+` window switcher (0043) got ERROR_ACCESS_DENIED from
+SetForegroundWindow. Windows gives the hotkey's owner that right; record
+the hotkey as the owner's latest input.
+
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -1802,6 +1802,8 @@
+     list_add_tail( &hotkey->queue->msg_list[POST_MESSAGE], &msg->entry );
+     set_queue_bits( hotkey->queue, QS_POSTMESSAGE|QS_ALLPOSTMESSAGE|QS_HOTKEY );
+     hotkey->queue->hotkey_count++;
++    /* like on Windows, the hotkey owner may then set the foreground window */
++    if (hotkey->queue->input) hotkey->queue->input->user_time = monotonic_time;
+     return 1;
+ }
+ 
